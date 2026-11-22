@@ -1,0 +1,84 @@
+# On every push to main: if the version in Cargo.toml has no release yet, build all platforms and
+# publish a GitHub Release "v<version>" (tag created on the pushed commit) with the binaries,
+# source archives and SHA256SUMS.txt. Bumping the version in Cargo.toml is what triggers a release.
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    # Releases only come from main, also when started by hand (workflow_dispatch can pick any branch).
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      exists: ${{ steps.v.outputs.exists }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: v
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if gh release view "v$version" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::v$version is already released; nothing to do."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            # gh release create reuses an existing tag and ignores --target, so a stray tag on another
+            # commit would publish binaries of this commit under that tag. Stop before building.
+            tag_sha=$(git ls-remote origin "refs/tags/v$version^{}" | cut -f1)
+            [ -n "$tag_sha" ] || tag_sha=$(git ls-remote origin "refs/tags/v$version" | cut -f1)
+            if [ -n "$tag_sha" ] && [ "$tag_sha" != "$GITHUB_SHA" ]; then
+              echo "::error::Tag v$version already points to $tag_sha, not $GITHUB_SHA. Delete the tag or bump the version."
+              exit 1
+            fi
+          fi
+
+  build:
+    needs: check
+    if: needs.check.outputs.exists == 'false'
+    uses: ./.github/workflows/build.yml
+
+  release:
+    needs: [check, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          pattern: loudnorm-*
+          merge-multiple: true
+
+      - name: Source archives and checksums
+        run: |
+          v="${{ needs.check.outputs.version }}"
+          git archive --format=tar.gz --prefix="loudnorm-v$v/" -o "dist/loudnorm-v$v-src.tar.gz" HEAD
+          git archive --format=zip --prefix="loudnorm-v$v/" -o "dist/loudnorm-v$v-src.zip" HEAD
+          cd dist
+          sha256sum -- * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          v="${{ needs.check.outputs.version }}"
+          pre=()
+          [[ "$v" == *-* ]] && pre=(--prerelease)
+          gh release create "v$v" dist/* --target "$GITHUB_SHA" --title "loudnorm v$v" --generate-notes "${pre[@]}"

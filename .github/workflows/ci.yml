@@ -1,0 +1,38 @@
+# Branch pushes: build and test every platform (same jobs as a release, without publishing).
+# Pull requests: remind when the version in Cargo.toml was not bumped.
+name: CI
+
+on:
+  push:
+    branches-ignore: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    if: github.event_name == 'push'
+    uses: ./.github/workflows/build.yml
+
+  version:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Compare version with the base branch
+        run: |
+          get() { sed -n 's/^version = "\(.*\)"/\1/p' | head -n1; }
+          head_v=$(get < Cargo.toml)
+          base_v=$(git show "origin/${{ github.base_ref }}:Cargo.toml" | get)
+          echo "base $base_v -> head $head_v"
+          # SemVer precedence (pre-releases sort below the release; build metadata is ignored).
+          order=$(python3 .github/scripts/semver_cmp.py "$base_v" "$head_v")
+          case "$order" in
+            eq) echo "::warning file=Cargo.toml::Version is unchanged ($head_v). Bump it unless this PR only touches CI/docs: patch = fixes, minor = features, major = drastic UI/algorithm changes." ;;
+            down) echo "::error file=Cargo.toml::Version $head_v is lower than $base_v on ${{ github.base_ref }}."; exit 1 ;;
+            up) ;;
+            *) echo "::error file=Cargo.toml::Cannot compare versions ($base_v, $head_v): $order"; exit 1 ;;
+          esac

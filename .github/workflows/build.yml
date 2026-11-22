@@ -1,0 +1,99 @@
+# Reusable: test, build and package loudnorm for every supported platform.
+# Each job uploads one artifact named "loudnorm-<target>" holding a .zip (Windows) or .tar.gz.
+name: Build
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, target: x86_64-pc-windows-msvc }
+          - { os: windows-11-arm, target: aarch64-pc-windows-msvc }
+          # Linux: link against glibc 2.17 with cargo-zigbuild, independent of the runner's own glibc,
+          # so the binary runs on old distributions and runner image upgrades do not change it.
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, glibc: "2.17" }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, glibc: "2.17" }
+          - { os: macos-15-intel, target: x86_64-apple-darwin }
+          - { os: macos-latest, target: aarch64-apple-darwin }
+    steps:
+      - uses: actions/checkout@v7
+
+      # Some images (e.g. Windows on Arm) may come without rustup.
+      - name: Install rustup if missing
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (-not (Get-Command rustup -ErrorAction SilentlyContinue)) {
+            $arch = if ($env:RUNNER_ARCH -eq 'ARM64') { 'aarch64' } else { 'x86_64' }
+            Invoke-WebRequest "https://static.rust-lang.org/rustup/dist/$arch-pc-windows-msvc/rustup-init.exe" -OutFile rustup-init.exe
+            ./rustup-init.exe -y --default-toolchain none --profile minimal
+            "$env:USERPROFILE\.cargo\bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+          }
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Test
+        run: cargo test --locked --release --target ${{ matrix.target }}
+
+      - name: Install cargo-zigbuild
+        if: matrix.glibc
+        run: |
+          python3 -m venv "$RUNNER_TEMP/zigbuild"
+          "$RUNNER_TEMP/zigbuild/bin/pip" install --quiet cargo-zigbuild==0.24.1 ziglang==0.17.1
+          echo "$RUNNER_TEMP/zigbuild/bin" >> "$GITHUB_PATH"
+
+      - name: Build
+        if: ${{ !matrix.glibc }}
+        run: cargo build --locked --release --target ${{ matrix.target }}
+
+      - name: Build (glibc ${{ matrix.glibc }})
+        if: matrix.glibc
+        run: cargo zigbuild --locked --release --target ${{ matrix.target }}.${{ matrix.glibc }}
+
+      - name: Check required glibc
+        if: matrix.glibc
+        run: |
+          need=$(objdump -T "target/${{ matrix.target }}/release/loudnorm" | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -n1)
+          echo "highest glibc symbol version: $need (limit ${{ matrix.glibc }})"
+          if [[ "$(printf '%s\n%s\n' "$need" "${{ matrix.glibc }}" | sort -V | tail -n1)" != "${{ matrix.glibc }}" ]]; then
+            echo "::error::binary needs glibc $need, newer than ${{ matrix.glibc }}"
+            exit 1
+          fi
+
+      - name: Package
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          name="loudnorm-v${version}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then exe=loudnorm.exe; else exe=loudnorm; fi
+          cp "target/${{ matrix.target }}/release/$exe" README.md "dist/$name/"
+          cd dist
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            pwsh -NoProfile -Command "Compress-Archive -Path '$name' -DestinationPath '$name.zip'"
+          else
+            tar czf "$name.tar.gz" "$name"
+          fi
+          rm -rf "$name"
+          ls -l
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: loudnorm-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
