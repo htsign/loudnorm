@@ -82,3 +82,30 @@ loudnorm --cli <フォルダ> [--method reencode|lossless|tags] [--tol 1.0] [--m
 ```
 
 `--apply` を付けない限りファイルは変更しません。Windows では GUI アプリとしてビルドされるため起動時にコンソールは開きません。`--cli` のときは起動元のコマンドプロンプトに出力しますが、プロンプトは処理の終了を待たずに戻ります（`start /wait loudnorm.exe --cli ...` で待てます）。
+
+## バージョンとリリース
+
+バージョンは `Cargo.toml` の `version` で管理し、変更のたびに次の基準で上げます（`Cargo.lock` も一緒に更新）。
+
+| 変更 | 上げる桁 | 例 |
+|---|---|---|
+| バグ修正などの軽微な変更 | パッチ（3 桁目） | 0.2.0 → 0.2.1 |
+| 機能追加 | マイナー（2 桁目） | 0.2.1 → 0.3.0 |
+| UI の根本的な変更、計算アルゴリズムの一新などの大きな変更 | メジャー（1 桁目） | 0.3.0 → 1.0.0 |
+
+`main` に push されたとき、その版のリリースがまだなければ GitHub Actions が全プラットフォーム向けにビルドし、Releases に `v<version>` として登録します（タグもそのコミットに作成）。
+
+| 配布ファイル | 対象 |
+|---|---|
+| `loudnorm-v<version>-x86_64-pc-windows-msvc.zip` | Windows x64 |
+| `loudnorm-v<version>-aarch64-pc-windows-msvc.zip` | Windows ARM64 |
+| `loudnorm-v<version>-x86_64-unknown-linux-gnu.tar.gz` | Linux x64（glibc 2.35 以降） |
+| `loudnorm-v<version>-aarch64-unknown-linux-gnu.tar.gz` | Linux ARM64（glibc 2.35 以降） |
+| `loudnorm-v<version>-x86_64-apple-darwin.tar.gz` | macOS Intel |
+| `loudnorm-v<version>-aarch64-apple-darwin.tar.gz` | macOS Apple シリコン |
+| `loudnorm-v<version>-src.tar.gz` / `-src.zip` | ソース |
+| `SHA256SUMS.txt` | 上記のチェックサム |
+
+macOS 版は署名していないため、初回はダウンロードしたファイルの隔離属性を外す（`xattr -d com.apple.quarantine loudnorm`）か、Finder の右クリックから開いてください。
+
+`main` 以外のブランチへの push でも同じビルドとテストが走ります（リリースはしません）。プルリクエストでは、バージョンが上がっていなければ警告します。
