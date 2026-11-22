@@ -12,12 +12,23 @@ use crate::apply::{self, ApplyOptions, Mp3Encode, Output};
 use crate::core::{self, Action, Method, PlanOptions, Stats, Target, Track};
 use crate::ffmpeg::Ffmpeg;
 use crate::settings::Settings;
+use crate::update::{self, Release, Version};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
     Idle,
     Analyzing,
     Applying,
+}
+
+/// Where the check for a newer release stands.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum UpdateState {
+    NotChecked,
+    Checking,
+    UpToDate,
+    Available(Release),
+    Failed(String),
 }
 
 struct Shared {
@@ -35,6 +46,8 @@ pub struct App {
     cancel: Arc<AtomicBool>,
     root: String,
     ff_hint: String,
+    /// The trimmed hint that `ff` was detected with; differs from `ff_hint` while a typed location is not yet applied.
+    ff_located_hint: String,
     ff: Result<Ffmpeg, String>,
     po: PlanOptions,
     mp3: Mp3Encode,
@@ -43,6 +56,7 @@ pub struct App {
     in_place: bool,
     out_dir: String,
     keep_mtime: bool,
+    check_updates: bool,
     jobs: usize,
     true_peak: bool,
     last_folder: String,
@@ -58,6 +72,12 @@ pub struct App {
     stats: Option<Stats>,
     graph: GraphView,
     auto_start: bool,
+    show_prefs: bool,
+    show_about: bool,
+    /// Written by the update-check thread, read by the UI.
+    update: Arc<Mutex<UpdateState>>,
+    /// Frame number (`Context::cumulative_frame_nr`) from which the folder picker chosen in the menu may open.
+    open_folder_at: Option<u64>,
 }
 
 const ACCENT: Color32 = Color32::from_rgb(64, 120, 242);
@@ -288,7 +308,7 @@ impl App {
         .map_err(|e| e.to_string());
         // A folder passed on the command line (or dropped on the exe) is analysed right away.
         let arg = std::env::args().nth(1).filter(|a| std::path::Path::new(a).is_dir());
-        App {
+        let app = App {
             auto_start: arg.is_some(),
             sh: Arc::new(Mutex::new(Shared {
                 tracks: Vec::new(),
@@ -307,6 +327,7 @@ impl App {
             })),
             cancel: Arc::new(AtomicBool::new(false)),
             root: arg.unwrap_or_else(|| st.last_folder.clone()),
+            ff_located_hint: ff_hint.trim().to_string(),
             ff_hint,
             ff,
             po: PlanOptions {
@@ -324,6 +345,7 @@ impl App {
             in_place: st.in_place,
             out_dir: st.output_folder.clone(),
             keep_mtime: st.keep_mtime,
+            check_updates: st.check_updates,
             jobs: st.jobs,
             true_peak: st.true_peak,
             last_folder: st.last_folder.clone(),
@@ -338,7 +360,39 @@ impl App {
             confirm: false,
             stats: None,
             graph,
+            show_prefs: false,
+            show_about: false,
+            update: Arc::new(Mutex::new(UpdateState::NotChecked)),
+            open_folder_at: None,
+        };
+        if app.check_updates {
+            app.start_update_check(&cc.egui_ctx);
         }
+        app
+    }
+
+    /// Look for a newer release on a background thread; does nothing while a check is already running.
+    fn start_update_check(&self, ctx: &egui::Context) {
+        {
+            let mut st = self.update.lock().unwrap();
+            if *st == UpdateState::Checking {
+                return;
+            }
+            *st = UpdateState::Checking;
+        }
+        let (state, ctx) = (self.update.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let result = match Version::parse(env!("CARGO_PKG_VERSION")) {
+                None => UpdateState::Failed("現在のバージョンを読み取れません".into()),
+                Some(current) => match update::fetch_latest() {
+                    Ok(r) if update::is_newer(&r.version, &current) => UpdateState::Available(r),
+                    Ok(_) => UpdateState::UpToDate,
+                    Err(e) => UpdateState::Failed(format!("{e:#}")),
+                },
+            };
+            *state.lock().unwrap() = result;
+            ctx.request_repaint();
+        });
     }
 
     fn current_settings(&self) -> Settings {
@@ -361,6 +415,7 @@ impl App {
             in_place: self.in_place,
             output_folder: self.out_dir.trim().to_string(),
             keep_mtime: self.keep_mtime,
+            check_updates: self.check_updates,
             window_width: self.win_w,
             window_height: self.win_h,
             window_maximized: self.win_max,
@@ -638,6 +693,161 @@ impl App {
         });
     }
 
+    /// Ask for a folder and analyse it.
+    fn pick_folder_and_analyze(&mut self, ctx: &egui::Context) {
+        if let Some(p) = rfd::FileDialog::new().pick_folder() {
+            self.root = p.display().to_string();
+            self.start_analyze(ctx);
+        }
+    }
+
+    /// ffmpeg location: status, hint field, folder / file pickers and re-detection.
+    fn ffmpeg_ui(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            match &self.ff {
+                Ok(f) => ui.label(RichText::new(format!("ffmpeg: {}", f.ffmpeg.display())).small().weak()).on_hover_text(&f.version),
+                Err(e) => ui.label(RichText::new(format!("⚠ {e}")).small().color(WARN)),
+            };
+        });
+        ui.horizontal(|ui| {
+            ui.add(egui::TextEdit::singleline(&mut self.ff_hint).desired_width(260.0).hint_text("ffmpeg の場所（任意）"));
+            let mut relocate = false;
+            if ui.small_button("フォルダ…").on_hover_text("ffmpeg と ffprobe があるフォルダを選ぶ").clicked() {
+                if let Some(p) = rfd::FileDialog::new().set_title("ffmpeg のあるフォルダ").pick_folder() {
+                    self.ff_hint = p.display().to_string();
+                    relocate = true;
+                }
+            }
+            if ui.small_button("ファイル…").on_hover_text("ffmpeg の実行ファイルを選ぶ").clicked() {
+                let mut d = rfd::FileDialog::new().set_title("ffmpeg の実行ファイル");
+                if cfg!(windows) {
+                    d = d.add_filter("ffmpeg.exe", &["exe"]);
+                }
+                if let Some(p) = d.pick_file() {
+                    self.ff_hint = p.display().to_string();
+                    relocate = true;
+                }
+            }
+            if ui.small_button("再検出").clicked() || relocate {
+                self.relocate_ffmpeg();
+            }
+        });
+    }
+
+    /// Detect ffmpeg again from the current hint (an empty hint falls back to the default search).
+    fn relocate_ffmpeg(&mut self) {
+        let hint = self.ff_hint.trim().to_string();
+        self.ff = Ffmpeg::locate(Some(std::path::Path::new(&hint))).map_err(|e| e.to_string());
+        self.ff_located_hint = hint;
+        let msg = match &self.ff {
+            Ok(f) => format!("ffmpeg: {}", f.ffmpeg.display()),
+            Err(e) => e.clone(),
+        };
+        self.log(msg);
+    }
+
+    /// Draws the menu bar; returns true when フォルダを開く… was chosen (the blocking picker is opened by the caller after the menu is drawn).
+    fn menu_bar_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, busy: bool) -> bool {
+        let mut open_folder = false;
+        egui::MenuBar::new().ui(ui, |ui| {
+            ui.menu_button("ファイル", |ui| {
+                if ui.add_enabled(!busy, egui::Button::new("フォルダを開く…")).clicked() {
+                    ui.close();
+                    open_folder = true;
+                }
+                ui.separator();
+                if ui.add_enabled(!busy, egui::Button::new("終了")).clicked() {
+                    ui.close();
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            });
+            ui.menu_button("設定", |ui| {
+                if ui.button("環境設定…").clicked() {
+                    ui.close();
+                    self.show_prefs = true;
+                }
+            });
+            ui.menu_button("ヘルプ", |ui| {
+                if ui.button("バージョン情報…").clicked() {
+                    ui.close();
+                    self.show_about = true;
+                }
+            });
+            let available = match &*self.update.lock().unwrap() {
+                UpdateState::Available(r) => Some(r.version),
+                _ => None,
+            };
+            if let Some(v) = available {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.link(RichText::new(format!("新しいバージョン v{v} があります")).color(ACCENT)).clicked() {
+                        self.show_about = true;
+                    }
+                });
+            }
+        });
+        open_folder
+    }
+
+    fn dialogs_ui(&mut self, ctx: &egui::Context) {
+        if self.show_prefs {
+            let resp = egui::Modal::new(egui::Id::unique("loudnorm-prefs")).show(ctx, |ui| {
+                ui.set_max_width(460.0);
+                ui.heading("環境設定");
+                ui.add_space(4.0);
+                ui.label("ffmpeg");
+                self.ffmpeg_ui(ui);
+                ui.add_space(8.0);
+                ui.label("更新");
+                ui.checkbox(&mut self.check_updates, "起動時に更新を確認する");
+                ui.add_space(8.0);
+                if ui.button("閉じる").clicked() {
+                    ui.close();
+                }
+            });
+            if resp.should_close() {
+                self.show_prefs = false;
+                // Whichever way the dialog is closed, a typed location must not stay saved but unused this session.
+                if self.ff_hint.trim() != self.ff_located_hint {
+                    self.relocate_ffmpeg();
+                }
+            }
+        }
+        if self.show_about {
+            let resp = egui::Modal::new(egui::Id::unique("loudnorm-about")).show(ctx, |ui| {
+                ui.set_max_width(460.0);
+                ui.heading("loudnorm");
+                ui.label(format!("現在のバージョン {}", env!("CARGO_PKG_VERSION")));
+                ui.add_space(8.0);
+                let state = self.update.lock().unwrap().clone();
+                match &state {
+                    UpdateState::NotChecked => {}
+                    UpdateState::Checking => {
+                        ui.label("確認中…");
+                    }
+                    UpdateState::UpToDate => {
+                        ui.label("最新版です");
+                    }
+                    UpdateState::Available(r) => {
+                        ui.label(RichText::new(format!("現在 {} → 最新 {}", env!("CARGO_PKG_VERSION"), r.version)).strong().color(ACCENT));
+                        ui.hyperlink_to("リリースページを開く", &r.url);
+                    }
+                    UpdateState::Failed(e) => {
+                        ui.label(RichText::new(format!("確認できませんでした: {e}")).color(WARN));
+                    }
+                }
+                if ui.add_enabled(state != UpdateState::Checking, egui::Button::new("更新を確認")).clicked() {
+                    self.start_update_check(ctx);
+                }
+                ui.add_space(8.0);
+                if ui.button("閉じる").clicked() {
+                    ui.close();
+                }
+            });
+            if resp.should_close() {
+                self.show_about = false;
+            }
+        }
+    }
 }
 
 impl eframe::App for App {
@@ -655,6 +865,19 @@ impl eframe::App for App {
             }
         }
         self.autosave(&ctx);
+        // The picker blocks the UI thread, so open it only after the menu has been painted closed; otherwise the open menu stays frozen on screen.
+        // Count painted frames, not ui() calls: a frame may run ui() more than once (request_discard).
+        if let Some(at) = self.open_folder_at {
+            if ctx.cumulative_frame_nr() >= at {
+                self.open_folder_at = None;
+                // Something may have started in the frame in between (e.g. 解析 was clicked); do not open the picker while busy.
+                if self.sh.lock().unwrap().phase == Phase::Idle {
+                    self.pick_folder_and_analyze(&ctx);
+                }
+            } else {
+                ctx.request_repaint();
+            }
+        }
         if std::mem::take(&mut self.auto_start) {
             self.start_analyze(&ctx);
         }
@@ -668,6 +891,13 @@ impl eframe::App for App {
             self.stats = core::plan(&mut s.tracks, &self.po);
         }
 
+        egui::Panel::top("menubar").show(ui, |ui| {
+            if self.menu_bar_ui(ui, &ctx, busy) {
+                self.open_folder_at = Some(ctx.cumulative_frame_nr() + 2);
+                ctx.request_repaint();
+            }
+        });
+
         egui::Panel::top("top").show(ui, |ui| {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
@@ -677,10 +907,7 @@ impl eframe::App for App {
                     egui::TextEdit::singleline(&mut self.root).desired_width(ui.available_width() - 260.0).hint_text("曲が入ったフォルダ（サブフォルダも対象）"),
                 );
                 if ui.add_enabled(!busy, egui::Button::new("選択…")).clicked() {
-                    if let Some(p) = rfd::FileDialog::new().pick_folder() {
-                        self.root = p.display().to_string();
-                        self.start_analyze(&ctx);
-                    }
+                    self.pick_folder_and_analyze(&ctx);
                 }
                 if ui.add_enabled(!busy && !self.root.trim().is_empty(), egui::Button::new(RichText::new("解析").strong())).clicked() {
                     self.start_analyze(&ctx);
@@ -689,39 +916,14 @@ impl eframe::App for App {
                     self.cancel.store(true, Ordering::SeqCst);
                 }
             });
-            ui.horizontal(|ui| {
-                match &self.ff {
-                    Ok(f) => ui.label(RichText::new(format!("ffmpeg: {}", f.ffmpeg.display())).small().weak()).on_hover_text(&f.version),
-                    Err(e) => ui.label(RichText::new(format!("⚠ {e}")).small().color(WARN)),
-                };
-                ui.add(egui::TextEdit::singleline(&mut self.ff_hint).desired_width(260.0).hint_text("ffmpeg の場所（任意）"));
-                let mut relocate = false;
-                if ui.small_button("フォルダ…").on_hover_text("ffmpeg と ffprobe があるフォルダを選ぶ").clicked() {
-                    if let Some(p) = rfd::FileDialog::new().set_title("ffmpeg のあるフォルダ").pick_folder() {
-                        self.ff_hint = p.display().to_string();
-                        relocate = true;
+            if let Err(e) = &self.ff {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(format!("⚠ {e}")).small().color(WARN));
+                    if ui.link(RichText::new("環境設定を開く").small()).clicked() {
+                        self.show_prefs = true;
                     }
-                }
-                if ui.small_button("ファイル…").on_hover_text("ffmpeg の実行ファイルを選ぶ").clicked() {
-                    let mut d = rfd::FileDialog::new().set_title("ffmpeg の実行ファイル");
-                    if cfg!(windows) {
-                        d = d.add_filter("ffmpeg.exe", &["exe"]);
-                    }
-                    if let Some(p) = d.pick_file() {
-                        self.ff_hint = p.display().to_string();
-                        relocate = true;
-                    }
-                }
-                if ui.small_button("再検出").clicked() || relocate {
-                    let h = PathBuf::from(self.ff_hint.trim());
-                    self.ff = Ffmpeg::locate(Some(&h)).map_err(|e| e.to_string());
-                    let msg = match &self.ff {
-                        Ok(f) => format!("ffmpeg: {}", f.ffmpeg.display()),
-                        Err(e) => e.clone(),
-                    };
-                    self.log(msg);
-                }
-            });
+                });
+            }
             if busy {
                 let label = if phase == Phase::Analyzing { "解析中" } else { "適用中" };
                 ui.add(egui::ProgressBar::new(if total > 0 { done as f32 / total as f32 } else { 0.0 }).text(format!("{label} {done} / {total}")));
@@ -908,6 +1110,8 @@ impl eframe::App for App {
                 self.col_w = measured;
             }
         });
+
+        self.dialogs_ui(&ctx);
 
         if self.confirm {
             let (n, dest) = {
