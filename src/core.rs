@@ -286,19 +286,127 @@ pub fn has_replaygain(path: &Path) -> bool {
 #[derive(Clone, Debug)]
 pub struct PlanOptions {
     pub method: Method,
-    /// Files whose loudness is within ±tolerance of the median stay untouched.
+    /// Files whose loudness is within ±tolerance of the target stay untouched.
     pub tolerance: f64,
     /// Upper limit for the true peak after a gain increase (dBTP).
     pub peak_ceiling: f64,
     pub limit_peak: bool,
     /// In lossless mode, re-encode lossy formats that have no lossless method (AAC, Vorbis).
     pub lossless_fallback_reencode: bool,
+    /// How the target loudness is chosen.
+    pub target: Target,
+    /// Target (LUFS) used when `target` is `Custom`.
+    pub custom_target: f64,
+}
+
+/// How the target loudness is derived from the analysed tracks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Target {
+    Median,
+    Mean,
+    /// Mean after dropping the quietest and loudest 10 %.
+    TrimmedMean,
+    /// The value that leaves the most tracks within the tolerance (fewest files changed).
+    MinChange,
+    Custom,
+}
+
+impl Target {
+    pub const ALL: [Target; 5] = [Target::Median, Target::Mean, Target::TrimmedMean, Target::MinChange, Target::Custom];
+    pub fn label(self) -> &'static str {
+        match self {
+            Target::Median => "中央値",
+            Target::Mean => "平均値",
+            Target::TrimmedMean => "トリム平均（上下 10% 除外）",
+            Target::MinChange => "変更が最少になる値",
+            Target::Custom => "カスタム",
+        }
+    }
+    pub fn key(self) -> &'static str {
+        match self {
+            Target::Median => "median",
+            Target::Mean => "mean",
+            Target::TrimmedMean => "trimmed_mean",
+            Target::MinChange => "min_change",
+            Target::Custom => "custom",
+        }
+    }
+    pub fn from_key(k: &str) -> Option<Target> {
+        Target::ALL.into_iter().find(|t| t.key() == k)
+    }
+}
+
+/// Summary statistics of the analysed loudness values (LUFS).
+#[derive(Clone, Debug, Default)]
+pub struct Stats {
+    pub n: usize,
+    pub min: f64,
+    pub max: f64,
+    pub mean: f64,
+    pub stdev: f64,
+    pub q1: f64,
+    pub median: f64,
+    pub q3: f64,
+    pub trimmed_mean: f64,
+    pub min_change: f64,
+    /// Tracks left within the tolerance by `min_change`.
+    pub min_change_kept: usize,
+    /// The target actually used for planning.
+    pub target: f64,
+}
+
+/// Percentile with linear interpolation between closest ranks (the common "type 7" definition).
+fn percentile(sorted: &[f64], p: f64) -> f64 {
+    let h = (sorted.len() - 1) as f64 * p;
+    let (lo, hi) = (h.floor() as usize, h.ceil() as usize);
+    sorted[lo] + (sorted[hi] - sorted[lo]) * (h - lo as f64)
+}
+
+/// Statistics of `sorted` (ascending, non-empty) for the given tolerance.
+pub fn stats(sorted: &[f64], tolerance: f64) -> Stats {
+    let n = sorted.len();
+    let mean = sorted.iter().sum::<f64>() / n as f64;
+    let var = if n > 1 { sorted.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1) as f64 } else { 0.0 };
+    let cut = n / 10;
+    let trimmed = &sorted[cut..n - cut];
+    let median = percentile(sorted, 0.5);
+    // Sliding window of width 2*tolerance: the window holding the most values gives the targets that keep
+    // the most tracks untouched (any T in [hi - tol, lo + tol]); prefer the one closest to the median.
+    let (mut best_kept, mut best_t, mut j) = (0usize, median, 0usize);
+    for i in 0..n {
+        if j < i {
+            j = i;
+        }
+        while j + 1 < n && sorted[j + 1] - sorted[i] <= 2.0 * tolerance + 1e-9 {
+            j += 1;
+        }
+        let kept = j - i + 1;
+        let t = median.clamp(sorted[j] - tolerance, sorted[i] + tolerance);
+        if kept > best_kept || (kept == best_kept && (t - median).abs() < (best_t - median).abs()) {
+            best_kept = kept;
+            best_t = t;
+        }
+    }
+    Stats {
+        n,
+        min: sorted[0],
+        max: sorted[n - 1],
+        mean,
+        stdev: var.sqrt(),
+        q1: percentile(sorted, 0.25),
+        median,
+        q3: percentile(sorted, 0.75),
+        trimmed_mean: trimmed.iter().sum::<f64>() / trimmed.len() as f64,
+        min_change: best_t,
+        min_change_kept: best_kept,
+        target: median,
+    }
 }
 
 pub const RG2_REFERENCE: f64 = -18.0;
 
-/// Fill `want`, `gain`, `action`, `note` for every track. Returns the median loudness.
-pub fn plan(tracks: &mut [Track], o: &PlanOptions) -> Option<f64> {
+/// Fill `want`, `gain`, `action`, `note` for every track. Returns the loudness statistics (with the target used).
+pub fn plan(tracks: &mut [Track], o: &PlanOptions) -> Option<Stats> {
     let mut ls: Vec<f64> = tracks.iter().filter(|t| t.include).filter_map(|t| t.loudness).collect();
     if ls.is_empty() {
         for t in tracks.iter_mut() {
@@ -310,8 +418,15 @@ pub fn plan(tracks: &mut [Track], o: &PlanOptions) -> Option<f64> {
         return None;
     }
     ls.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let n = ls.len();
-    let median = if n % 2 == 1 { ls[n / 2] } else { (ls[n / 2 - 1] + ls[n / 2]) / 2.0 };
+    let mut st = stats(&ls, o.tolerance);
+    st.target = match o.target {
+        Target::Median => st.median,
+        Target::Mean => st.mean,
+        Target::TrimmedMean => st.trimmed_mean,
+        Target::MinChange => st.min_change,
+        Target::Custom => o.custom_target,
+    };
+    let target = st.target;
 
     for t in tracks.iter_mut() {
         t.note.clear();
@@ -336,7 +451,7 @@ pub fn plan(tracks: &mut [Track], o: &PlanOptions) -> Option<f64> {
             }
             continue;
         }
-        let diff = median - l;
+        let diff = target - l;
         if diff.abs() <= o.tolerance {
             continue;
         }
@@ -392,7 +507,7 @@ pub fn plan(tracks: &mut [Track], o: &PlanOptions) -> Option<f64> {
             t.note = append(&t.note, "既存の ReplayGain 値は補正前のまま");
         }
     }
-    Some(median)
+    Some(st)
 }
 
 /// One MP3 global_gain step: 2^(1/4) in amplitude.
@@ -400,4 +515,30 @@ pub const MP3_STEP_DB: f64 = 1.505_149_978_319_906;
 
 fn append(a: &str, b: &str) -> String {
     if a.is_empty() { b.to_string() } else { format!("{a}、{b}") }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn statistics() {
+        let v = [-30.0, -20.0, -19.0, -18.5, -18.0, -10.0];
+        let s = stats(&v, 1.0);
+        assert!((s.median - -18.75).abs() < 1e-9);
+        assert!((s.mean - -19.25).abs() < 1e-9);
+        assert!((s.q1 - -19.75).abs() < 1e-9 && (s.q3 - -18.125).abs() < 1e-9);
+        // -20 .. -18 fits in a 2 dB window: 4 tracks kept, target in [-19, -19] -> -19.
+        assert_eq!(s.min_change_kept, 4);
+        assert!((s.min_change - -19.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn min_change_prefers_median_side() {
+        // Windows around -20 and -10 both keep 3 and are equally far from the median (-15); the first one wins.
+        let v = [-21.0, -20.0, -19.0, -15.0, -11.0, -10.0, -9.0];
+        let s = stats(&v, 1.0);
+        assert_eq!(s.min_change_kept, 3);
+        assert!(s.min_change < -18.0);
+    }
 }

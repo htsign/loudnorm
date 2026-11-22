@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use crate::apply::Mp3Encode;
-use crate::core::Method;
+use crate::core::{Method, Target};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Settings {
@@ -19,6 +19,9 @@ pub struct Settings {
     pub limit_peak: bool,
     pub peak_ceiling: f64,
     pub lossless_fallback_reencode: bool,
+    pub target: Target,
+    pub custom_target: f64,
+    pub histogram: bool,
     pub mp3: Mp3Encode,
     pub aac_kbps: u32,
     pub vorbis_q: u32,
@@ -52,6 +55,9 @@ impl Default for Settings {
             limit_peak: true,
             peak_ceiling: -1.0,
             lossless_fallback_reencode: false,
+            target: Target::Median,
+            custom_target: -16.0,
+            histogram: false,
             mp3: Mp3Encode::Cbr320,
             aac_kbps: 256,
             vorbis_q: 8,
@@ -117,6 +123,9 @@ impl Settings {
              limit_peak = {}\n\
              peak_ceiling_dbtp = {}\n\
              lossless_fallback_reencode = {}\n\
+             ; median | mean | trimmed_mean | min_change | custom\n\
+             target = {}\n\
+             custom_target_lufs = {}\n\
              \n\
              [encode]\n\
              ; cbr320 | cbr256 | v0\n\
@@ -138,6 +147,8 @@ impl Settings {
              width = {}\n\
              height = {}\n\
              maximized = {}\n\
+             ; 上部のグラフをヒストグラムで表示するか\n\
+             histogram = {}\n\
              \n\
              [table]\n\
              ; フォルダ, ファイル名, 形式, LUFS, 中央値差, ピーク, 補正, 処理 の列幅\n\
@@ -149,6 +160,8 @@ impl Settings {
             self.limit_peak,
             self.peak_ceiling,
             self.lossless_fallback_reencode,
+            self.target.key(),
+            self.custom_target,
             mp3_str(self.mp3),
             self.aac_kbps,
             self.vorbis_q,
@@ -160,6 +173,7 @@ impl Settings {
             self.window_width,
             self.window_height,
             self.window_maximized,
+            self.histogram,
             self.column_widths.iter().map(|w| format!("{w}")).collect::<Vec<_>>().join(", "),
         )
     }
@@ -214,6 +228,8 @@ impl Settings {
         take!("plan.limit_peak", s.limit_peak, b);
         take!("plan.peak_ceiling_dbtp", s.peak_ceiling, |v: &str| f(v).filter(|x| (-6.0..=0.0).contains(x)));
         take!("plan.lossless_fallback_reencode", s.lossless_fallback_reencode, b);
+        take!("plan.target", s.target, Target::from_key);
+        take!("plan.custom_target_lufs", s.custom_target, |v: &str| f(v).filter(|x| (-60.0..=0.0).contains(x)));
         take!("encode.mp3", s.mp3, |v: &str| match v {
             "cbr320" => Some(Mp3Encode::Cbr320),
             "cbr256" => Some(Mp3Encode::Cbr256),
@@ -231,6 +247,7 @@ impl Settings {
         take!("window.width", s.window_width, size);
         take!("window.height", s.window_height, size);
         take!("window.maximized", s.window_maximized, b);
+        take!("window.histogram", s.histogram, b);
         take!("table.column_widths", s.column_widths, |v: &str| {
             let ws: Option<Vec<f32>> = v.split(',').map(|x| x.trim().parse::<f32>().ok().filter(|w| (20.0..=4000.0).contains(w))).collect();
             ws.filter(|ws| ws.len() == DEFAULT_COLUMN_WIDTHS.len())
@@ -280,6 +297,9 @@ mod tests {
             limit_peak: false,
             peak_ceiling: -0.5,
             lossless_fallback_reencode: true,
+            target: Target::MinChange,
+            custom_target: -14.5,
+            histogram: true,
             mp3: Mp3Encode::V0,
             aac_kbps: 320,
             vorbis_q: 6,

@@ -9,7 +9,7 @@ use egui_extras::{Column, TableBuilder};
 use rayon::prelude::*;
 
 use crate::apply::{self, ApplyOptions, Mp3Encode, Output};
-use crate::core::{self, Action, Method, PlanOptions, Track};
+use crate::core::{self, Action, Method, PlanOptions, Stats, Target, Track};
 use crate::ffmpeg::Ffmpeg;
 use crate::settings::Settings;
 
@@ -55,7 +55,8 @@ pub struct App {
     col_w: Vec<f32>,
     only_changes: bool,
     confirm: bool,
-    median: Option<f64>,
+    stats: Option<Stats>,
+    graph: GraphView,
     auto_start: bool,
 }
 
@@ -141,10 +142,144 @@ fn elide_middle(ui: &egui::Ui, text: &str) -> String {
     out
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GraphView {
+    Dots,
+    Histogram,
+}
+
+fn short_label(t: Target) -> &'static str {
+    match t {
+        Target::TrimmedMean => "トリム平均",
+        Target::MinChange => "変更最少",
+        _ => t.label(),
+    }
+}
+
+/// Loudness graph: one dot per track (with its planned move) or a histogram, the target line and the
+/// tolerance band, and a Q1–median–Q3 box. Returns the LUFS value the user clicked, if any.
+fn loudness_graph(ui: &mut egui::Ui, tracks: &[Track], st: Option<&Stats>, po: &PlanOptions, view: GraphView) -> Option<f64> {
+    let pts: Vec<(f64, f64, Action, bool)> = tracks
+        .iter()
+        .filter(|t| t.include)
+        .filter_map(|t| t.loudness.map(|l| (l, t.gain, t.action, t.error.is_some())))
+        .collect();
+    let h = if view == GraphView::Histogram { 140.0 } else { 84.0 };
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), h), egui::Sense::click());
+    let p = ui.painter_at(rect);
+    p.rect_filled(rect, 6.0, ui.visuals().extreme_bg_color);
+    let (Some(st), false) = (st, pts.is_empty()) else { return None };
+    let weak = ui.visuals().weak_text_color();
+    let tags = po.method == Method::Tags;
+    let lo = pts.iter().map(|x| x.0.min(x.0 + x.1)).fold(st.target, f64::min).min(st.min) - 1.0;
+    let hi = pts.iter().map(|x| x.0.max(x.0 + x.1)).fold(st.target, f64::max).max(st.max) + 1.0;
+    let (lo, hi) = if tags { (st.min - 1.0, st.max + 1.0) } else { (lo, hi) };
+    let pad = 14.0;
+    let w = rect.width() - 2.0 * pad;
+    let x = |v: f64| rect.left() + pad + ((v - lo) / (hi - lo).max(1e-6)) as f32 * w;
+    let inv = |px: f32| lo + ((px - rect.left() - pad) / w) as f64 * (hi - lo);
+    let top = rect.top() + 6.0;
+    let axis_y = rect.bottom() - 18.0;
+    let box_y = axis_y - 8.0;
+    let plot_bottom = box_y - 8.0;
+
+    if !tags {
+        let band = egui::Rect::from_x_y_ranges(x(st.target - po.tolerance)..=x(st.target + po.tolerance), top..=plot_bottom);
+        p.rect_filled(band, 3.0, ACCENT.gamma_multiply(0.15));
+    }
+    match view {
+        GraphView::Dots => {
+            let mid_y = (top + plot_bottom) / 2.0;
+            let n = pts.len().max(1);
+            for (i, (l, g, a, err)) in pts.iter().enumerate() {
+                let y = mid_y + ((i * 7919) % 17) as f32 - 8.0; // light jitter so dots don't stack
+                let c = if *err || *a == Action::Skip {
+                    BAD
+                } else if a.changes_file() {
+                    WARN
+                } else {
+                    weak
+                };
+                if a.changes_file() && *a != Action::ReplayGainTag {
+                    p.line_segment([egui::pos2(x(*l), y), egui::pos2(x(l + g), y)], Stroke::new(1.0, c.gamma_multiply(0.6)));
+                }
+                p.circle_filled(egui::pos2(x(*l), y), if n > 400 { 2.0 } else { 3.0 }, c);
+            }
+        }
+        GraphView::Histogram => {
+            // Bin width: 0.5 LU for narrow spreads, otherwise 1 LU.
+            let bw = if st.max - st.min <= 12.0 { 0.5 } else { 1.0 };
+            let first = (lo / bw).floor() * bw;
+            let nb = (((hi - first) / bw).ceil() as usize).max(1);
+            let mut bins = vec![(0usize, 0usize); nb]; // (kept, changed)
+            for (l, _, a, _) in &pts {
+                let i = (((l - first) / bw).floor() as usize).min(nb - 1);
+                if a.changes_file() { bins[i].1 += 1 } else { bins[i].0 += 1 }
+            }
+            let maxc = bins.iter().map(|b| b.0 + b.1).max().unwrap_or(1).max(1);
+            let unit = (plot_bottom - top - 12.0) / maxc as f32;
+            let font = egui::FontId::proportional(10.0);
+            for (i, (k, c)) in bins.iter().enumerate() {
+                if k + c == 0 {
+                    continue;
+                }
+                let x0 = x(first + i as f64 * bw) + 0.5;
+                let x1 = x(first + (i + 1) as f64 * bw) - 0.5;
+                let yk = plot_bottom - *k as f32 * unit;
+                let yc = yk - *c as f32 * unit;
+                p.rect_filled(egui::Rect::from_x_y_ranges(x0..=x1, yk..=plot_bottom), 1.0, weak.gamma_multiply(0.8));
+                p.rect_filled(egui::Rect::from_x_y_ranges(x0..=x1, yc..=yk), 1.0, WARN);
+                if x1 - x0 > 9.0 {
+                    p.text(egui::pos2((x0 + x1) / 2.0, yc - 1.0), egui::Align2::CENTER_BOTTOM, format!("{}", k + c), font.clone(), weak);
+                }
+            }
+        }
+    }
+    // Box: Q1–Q3 with the median tick, and the mean as a small diamond.
+    let bstroke = Stroke::new(1.0, weak);
+    p.line_segment([egui::pos2(x(st.min), box_y), egui::pos2(x(st.max), box_y)], bstroke);
+    p.rect_stroke(egui::Rect::from_x_y_ranges(x(st.q1)..=x(st.q3), box_y - 4.0..=box_y + 4.0), 1.0, bstroke, egui::StrokeKind::Middle);
+    p.line_segment([egui::pos2(x(st.median), box_y - 4.0), egui::pos2(x(st.median), box_y + 4.0)], Stroke::new(2.0, weak));
+    let m = egui::pos2(x(st.mean), box_y);
+    p.add(egui::Shape::convex_polygon(
+        vec![m + egui::vec2(0.0, -3.5), m + egui::vec2(3.5, 0.0), m + egui::vec2(0.0, 3.5), m + egui::vec2(-3.5, 0.0)],
+        ui.visuals().text_color(),
+        Stroke::NONE,
+    ));
+    if !tags {
+        p.line_segment([egui::pos2(x(st.target), top - 2.0), egui::pos2(x(st.target), plot_bottom)], Stroke::new(1.5, ACCENT));
+    }
+    // Axis labels.
+    let font = egui::FontId::proportional(11.0);
+    let step = if hi - lo > 24.0 { 6.0 } else if hi - lo > 10.0 { 2.0 } else { 1.0 };
+    let mut v = (lo / step).ceil() * step;
+    while v <= hi {
+        p.text(egui::pos2(x(v), rect.bottom() - 3.0), egui::Align2::CENTER_BOTTOM, format!("{v:.0}"), font.clone(), weak);
+        v += step;
+    }
+    p.text(egui::pos2(rect.right() - 6.0, rect.top() + 4.0), egui::Align2::RIGHT_TOP, "LUFS", font, weak);
+    // Hover guide and click-to-set.
+    if tags {
+        return None;
+    }
+    if let Some(pos) = resp.hover_pos() {
+        let v = inv(pos.x);
+        p.line_segment([egui::pos2(pos.x, top), egui::pos2(pos.x, plot_bottom)], Stroke::new(1.0, ui.visuals().text_color().gamma_multiply(0.4)));
+        let kept = pts.iter().filter(|q| (q.0 - v).abs() <= po.tolerance).count();
+        resp.clone().on_hover_text(format!("{v:.1} LUFS を目標にする（変更なし {kept} / {} 曲）", pts.len()));
+    }
+    if resp.clicked() {
+        resp.interact_pointer_pos().map(|pos| inv(pos.x))
+    } else {
+        None
+    }
+}
+
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, st: Settings, settings_msg: String) -> Self {
         let font = install_fonts(&cc.egui_ctx);
         let ff_hint = st.ffmpeg.clone();
+        let graph = if st.histogram { GraphView::Histogram } else { GraphView::Dots };
         let ff = if ff_hint.trim().is_empty() {
             Ffmpeg::locate(None)
         } else {
@@ -180,6 +315,8 @@ impl App {
                 peak_ceiling: st.peak_ceiling,
                 limit_peak: st.limit_peak,
                 lossless_fallback_reencode: st.lossless_fallback_reencode,
+                target: st.target,
+                custom_target: st.custom_target,
             },
             mp3: st.mp3,
             aac_kbps: st.aac_kbps,
@@ -199,7 +336,8 @@ impl App {
             saved: st,
             only_changes: false,
             confirm: false,
-            median: None,
+            stats: None,
+            graph,
         }
     }
 
@@ -212,6 +350,9 @@ impl App {
             limit_peak: self.po.limit_peak,
             peak_ceiling: self.po.peak_ceiling,
             lossless_fallback_reencode: self.po.lossless_fallback_reencode,
+            target: self.po.target,
+            custom_target: self.po.custom_target,
+            histogram: self.graph == GraphView::Histogram,
             mp3: self.mp3,
             aac_kbps: self.aac_kbps,
             vorbis_q: self.vorbis_q,
@@ -407,7 +548,41 @@ impl App {
                     ui.label("許容幅 ±");
                     ui.add(egui::DragValue::new(&mut self.po.tolerance).range(0.0..=10.0).speed(0.05).suffix(" dB"));
                 });
-                ui.label(RichText::new("中央値からこの幅に収まる曲は変更しません").small().weak());
+                ui.label(RichText::new("目標からこの幅に収まる曲は変更しません").small().weak());
+                ui.label("目標");
+                let prev = self.po.target;
+                for t in Target::ALL {
+                    let val = self.stats.as_ref().map(|st| match t {
+                        Target::Median => st.median,
+                        Target::Mean => st.mean,
+                        Target::TrimmedMean => st.trimmed_mean,
+                        Target::MinChange => st.min_change,
+                        Target::Custom => self.po.custom_target,
+                    });
+                    let text = match val {
+                        Some(v) if t != Target::Custom => format!("{}：{:.1}", t.label(), v),
+                        _ => t.label().to_string(),
+                    };
+                    let r = ui.radio_value(&mut self.po.target, t, text);
+                    if t == Target::MinChange {
+                        if let Some(st) = &self.stats {
+                            r.on_hover_text(format!("許容幅に収まる曲が最も多くなる値（{} / {} 曲がそのまま）。候補が複数あるときは中央値に近いもの", st.min_change_kept, st.n));
+                        }
+                    }
+                }
+                if self.po.target == Target::Custom && prev != Target::Custom {
+                    // Start from the target in use so switching to custom does not jump.
+                    if let Some(st) = &self.stats {
+                        self.po.custom_target = (st.target * 10.0).round() / 10.0;
+                    }
+                }
+                ui.horizontal(|ui| {
+                    ui.add_space(18.0);
+                    let r = ui.add(egui::DragValue::new(&mut self.po.custom_target).range(-60.0..=0.0).speed(0.05).fixed_decimals(1).suffix(" LUFS"));
+                    if r.changed() {
+                        self.po.target = Target::Custom;
+                    }
+                });
                 ui.checkbox(&mut self.po.limit_peak, "上げるときはピークを制限");
                 ui.add_enabled_ui(self.po.limit_peak, |ui| {
                     ui.horizontal(|ui| {
@@ -463,55 +638,6 @@ impl App {
         });
     }
 
-    fn distribution(&self, ui: &mut egui::Ui, tracks: &[Track]) {
-        let pts: Vec<(f64, f64, Action, bool)> = tracks
-            .iter()
-            .filter(|t| t.include)
-            .filter_map(|t| t.loudness.map(|l| (l, t.gain, t.action, t.error.is_some())))
-            .collect();
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 76.0), egui::Sense::hover());
-        let p = ui.painter_at(rect);
-        p.rect_filled(rect, 6.0, ui.visuals().extreme_bg_color);
-        if pts.is_empty() {
-            return;
-        }
-        let lo = pts.iter().map(|x| x.0.min(x.0 + x.1)).fold(f64::INFINITY, f64::min) - 1.0;
-        let hi = pts.iter().map(|x| x.0.max(x.0 + x.1)).fold(f64::NEG_INFINITY, f64::max) + 1.0;
-        let pad = 14.0;
-        let x = |v: f64| rect.left() + pad + ((v - lo) / (hi - lo).max(1e-6)) as f32 * (rect.width() - 2.0 * pad);
-        let mid_y = rect.top() + 30.0;
-        if let (Some(m), true) = (self.median, self.po.method != Method::Tags) {
-            let band = egui::Rect::from_x_y_ranges(
-                x(m - self.po.tolerance)..=x(m + self.po.tolerance),
-                rect.top() + 6.0..=rect.bottom() - 22.0,
-            );
-            p.rect_filled(band, 3.0, ACCENT.gamma_multiply(0.15));
-            p.line_segment([egui::pos2(x(m), rect.top() + 4.0), egui::pos2(x(m), rect.bottom() - 20.0)], Stroke::new(1.5, ACCENT));
-        }
-        let n = pts.len().max(1);
-        for (i, (l, g, a, err)) in pts.iter().enumerate() {
-            let y = mid_y + ((i * 7919) % 17) as f32 - 8.0; // light jitter so dots don't stack
-            let c = if *err || *a == Action::Skip {
-                BAD
-            } else if a.changes_file() {
-                WARN
-            } else {
-                ui.visuals().weak_text_color()
-            };
-            if a.changes_file() && a != &Action::ReplayGainTag {
-                p.line_segment([egui::pos2(x(*l), y), egui::pos2(x(l + g), y)], Stroke::new(1.0, c.gamma_multiply(0.6)));
-            }
-            p.circle_filled(egui::pos2(x(*l), y), if n > 400 { 2.0 } else { 3.0 }, c);
-        }
-        let font = egui::FontId::proportional(11.0);
-        let step = if hi - lo > 24.0 { 6.0 } else if hi - lo > 10.0 { 2.0 } else { 1.0 };
-        let mut v = (lo / step).ceil() * step;
-        while v <= hi {
-            p.text(egui::pos2(x(v), rect.bottom() - 4.0), egui::Align2::CENTER_BOTTOM, format!("{v:.0}"), font.clone(), ui.visuals().weak_text_color());
-            v += step;
-        }
-        p.text(egui::pos2(rect.right() - 6.0, rect.top() + 4.0), egui::Align2::RIGHT_TOP, "LUFS", font, ui.visuals().weak_text_color());
-    }
 }
 
 impl eframe::App for App {
@@ -539,7 +665,7 @@ impl eframe::App for App {
         let busy = phase != Phase::Idle;
         if !busy && analyzed {
             let mut s = self.sh.lock().unwrap();
-            self.median = core::plan(&mut s.tracks, &self.po);
+            self.stats = core::plan(&mut s.tracks, &self.po);
         }
 
         egui::Panel::top("top").show(ui, |ui| {
@@ -604,10 +730,9 @@ impl eframe::App for App {
         });
 
         egui::Panel::left("settings").resizable(false).default_size(290.0).show(ui, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                ui.add_space(6.0);
-                self.settings_ui(ui, busy);
-                ui.add_space(12.0);
+            // The apply button stays visible at the bottom; the settings above scroll.
+            egui::Panel::bottom("apply_bar").show_separator_line(false).show(ui, |ui| {
+                ui.add_space(8.0);
                 let s = self.sh.lock().unwrap();
                 let n_change = s.tracks.iter().filter(|t| t.include && t.action.changes_file()).count();
                 drop(s);
@@ -622,6 +747,12 @@ impl eframe::App for App {
                 } else if !out_ok {
                     ui.label(RichText::new("出力フォルダを指定してください").small().color(WARN));
                 }
+                ui.add_space(6.0);
+            });
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                ui.add_space(6.0);
+                self.settings_ui(ui, busy);
+                ui.add_space(12.0);
             });
         });
 
@@ -646,10 +777,10 @@ impl eframe::App for App {
             let skipped = s.tracks.iter().filter(|t| t.include && t.action == Action::Skip && t.error.is_none()).count();
             let errs = s.tracks.iter().filter(|t| t.error.is_some()).count();
             ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new(match self.median {
-                    Some(m) if self.po.method == Method::Tags => format!("中央値 {m:.1} LUFS（タグは基準 −18 LUFS で計算）"),
-                    Some(m) => format!("中央値 {m:.1} LUFS"),
-                    None => "中央値 —".into(),
+                ui.label(RichText::new(match &self.stats {
+                    _ if self.po.method == Method::Tags => "ReplayGain 基準 −18 LUFS".to_string(),
+                    Some(st) => format!("目標 {:.1} LUFS（{}）", st.target, short_label(self.po.target)),
+                    None => "目標 —".into(),
                 }).strong().size(18.0).color(ACCENT));
                 ui.label(format!("解析済み {} 曲", ok.len()));
                 ui.label(format!("変更なし {} 曲", ok.len() - changed));
@@ -662,13 +793,29 @@ impl eframe::App for App {
                 }
                 ui.checkbox(&mut self.only_changes, "変更する曲だけ表示");
             });
-            self.distribution(ui, &s.tracks);
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.graph, GraphView::Dots, "分布（各曲）");
+                ui.selectable_value(&mut self.graph, GraphView::Histogram, "ヒストグラム");
+                if let Some(st) = &self.stats {
+                    ui.label(RichText::new(format!(
+                        "n={}　平均 {:.1}　中央値 {:.1}　Q1 {:.1}　Q3 {:.1}　σ {:.1}　範囲 {:.1}〜{:.1}　（クリックで目標を設定）",
+                        st.n, st.mean, st.median, st.q1, st.q3, st.stdev, st.min, st.max
+                    )).small().weak());
+                }
+            });
+            let pick = loudness_graph(ui, &s.tracks, self.stats.as_ref(), &self.po, self.graph);
+            if let Some(v) = pick {
+                if self.po.method != Method::Tags {
+                    self.po.target = Target::Custom;
+                    self.po.custom_target = (v * 10.0).round() / 10.0;
+                }
+            }
             ui.add_space(6.0);
 
             let vis: Vec<usize> = (0..s.tracks.len())
                 .filter(|&i| !self.only_changes || s.tracks[i].action.changes_file() || s.tracks[i].action == Action::Skip)
                 .collect();
-            let median = self.median;
+            let target = self.stats.as_ref().map(|st| st.target);
             let tol = self.po.tolerance;
             const MIN_W: [f32; 8] = [60.0, 80.0, 40.0, 48.0, 48.0, 48.0, 48.0, 60.0];
             let mut measured = self.col_w.clone();
@@ -682,7 +829,7 @@ impl eframe::App for App {
             }
             tb.column(Column::remainder().clip(true))
                 .header(22.0, |mut h| {
-                    let titles = ["", "フォルダ", "ファイル名", "形式", "LUFS", "中央値差", "ピーク", "補正", "処理", "備考 / 結果"];
+                    let titles = ["", "フォルダ", "ファイル名", "形式", "LUFS", "目標差", "ピーク", "補正", "処理", "備考 / 結果"];
                     for (i, t) in titles.into_iter().enumerate() {
                         h.col(|ui| {
                             // Remember the current width of each resizable column (saved to the settings file).
@@ -716,7 +863,7 @@ impl eframe::App for App {
                             ui.label(t.loudness.map(|l| format!("{l:.1}")).unwrap_or_else(|| if t.error.is_some() { "—".into() } else { "…".into() }));
                         });
                         row.col(|ui| {
-                            if let (Some(l), Some(m)) = (t.loudness, median) {
+                            if let (Some(l), Some(m)) = (t.loudness, target) {
                                 let d = l - m;
                                 let txt = RichText::new(format!("{d:+.1}"));
                                 ui.label(if d.abs() > tol { txt.color(WARN) } else { txt.weak() });

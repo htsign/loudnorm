@@ -36,7 +36,7 @@ fn main() -> anyhow::Result<()> {
 }
 
 /// Headless mode for scripting and tests:
-/// `--cli <dir> [--method reencode|lossless|tags] [--tol dB] [--mp3 cbr320|cbr256|v0] [--out DIR] [--jobs N] [--sample-peak] [--apply]`
+/// `--cli <dir> [--method reencode|lossless|tags] [--tol dB] [--mp3 cbr320|cbr256|v0] [--out DIR] [--jobs N] [--sample-peak] [--target median|mean|trimmed_mean|min_change|custom] [--custom LUFS] [--apply]`
 fn cli(args: &[String]) -> anyhow::Result<()> {
     let root = PathBuf::from(args.first().ok_or_else(|| anyhow::anyhow!("フォルダを指定してください"))?);
     let get = |k: &str| args.iter().position(|a| a == k).and_then(|i| args.get(i + 1)).cloned();
@@ -51,6 +51,8 @@ fn cli(args: &[String]) -> anyhow::Result<()> {
         peak_ceiling: -1.0,
         limit_peak: true,
         lossless_fallback_reencode: args.iter().any(|a| a == "--fallback"),
+        target: get("--target").as_deref().and_then(core::Target::from_key).unwrap_or(core::Target::Median),
+        custom_target: get("--custom").and_then(|s| s.parse().ok()).unwrap_or(-16.0),
     };
     let ff = ffmpeg::Ffmpeg::locate(None).ok();
     let jobs = get("--jobs").and_then(|s| s.parse::<usize>().ok()).unwrap_or_else(settings::default_jobs);
@@ -69,8 +71,13 @@ fn cli(args: &[String]) -> anyhow::Result<()> {
         t.has_rg = core::has_replaygain(&t.path);
     });
     eprintln!("analysis: {} files in {:.2}s ({} threads)", tracks.len(), t0.elapsed().as_secs_f64(), rayon::current_num_threads());
-    let median = core::plan(&mut tracks, &po);
-    println!("median\t{}", median.map(|m| format!("{m:.2}")).unwrap_or("-".into()));
+    let st = core::plan(&mut tracks, &po);
+    if let Some(st) = &st {
+        println!(
+            "target\t{:.2}\tmedian {:.2} mean {:.2} trimmed {:.2} min_change {:.2} (kept {}/{}) q1 {:.2} q3 {:.2} sd {:.2}",
+            st.target, st.median, st.mean, st.trimmed_mean, st.min_change, st.min_change_kept, st.n, st.q1, st.q3, st.stdev
+        );
+    }
     let ao = apply::ApplyOptions {
         output: match get("--out") {
             Some(d) => apply::Output::Folder(PathBuf::from(d)),
