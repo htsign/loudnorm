@@ -279,7 +279,7 @@ impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, st: Settings, settings_msg: String) -> Self {
         let font = install_fonts(&cc.egui_ctx);
         let ff_hint = st.ffmpeg.clone();
-        let graph = if st.histogram { GraphView::Histogram } else { GraphView::Dots };
+        let graph = if st.density { GraphView::Histogram } else { GraphView::Dots };
         let ff = if ff_hint.trim().is_empty() {
             Ffmpeg::locate(None)
         } else {
@@ -352,7 +352,7 @@ impl App {
             lossless_fallback_reencode: self.po.lossless_fallback_reencode,
             target: self.po.target,
             custom_target: self.po.custom_target,
-            histogram: self.graph == GraphView::Histogram,
+            density: self.graph == GraphView::Histogram,
             mp3: self.mp3,
             aac_kbps: self.aac_kbps,
             vorbis_q: self.vorbis_q,

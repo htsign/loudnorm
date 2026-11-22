@@ -21,7 +21,7 @@ pub struct Settings {
     pub lossless_fallback_reencode: bool,
     pub target: Target,
     pub custom_target: f64,
-    pub histogram: bool,
+    pub density: bool,
     pub mp3: Mp3Encode,
     pub aac_kbps: u32,
     pub vorbis_q: u32,
@@ -57,7 +57,7 @@ impl Default for Settings {
             lossless_fallback_reencode: false,
             target: Target::Median,
             custom_target: -16.0,
-            histogram: false,
+            density: false,
             mp3: Mp3Encode::Cbr320,
             aac_kbps: 256,
             vorbis_q: 8,
@@ -173,7 +173,7 @@ impl Settings {
             self.window_width,
             self.window_height,
             self.window_maximized,
-            self.histogram,
+            self.density,
             self.column_widths.iter().map(|w| format!("{w}")).collect::<Vec<_>>().join(", "),
         )
     }
@@ -247,7 +247,7 @@ impl Settings {
         take!("window.width", s.window_width, size);
         take!("window.height", s.window_height, size);
         take!("window.maximized", s.window_maximized, b);
-        take!("window.histogram", s.histogram, b);
+        take!("window.histogram", s.density, b);
         take!("table.column_widths", s.column_widths, |v: &str| {
             let ws: Option<Vec<f32>> = v.split(',').map(|x| x.trim().parse::<f32>().ok().filter(|w| (20.0..=4000.0).contains(w))).collect();
             ws.filter(|ws| ws.len() == DEFAULT_COLUMN_WIDTHS.len())
@@ -299,7 +299,7 @@ mod tests {
             lossless_fallback_reencode: true,
             target: Target::MinChange,
             custom_target: -14.5,
-            histogram: true,
+            density: true,
             mp3: Mp3Encode::V0,
             aac_kbps: 320,
             vorbis_q: 6,
