@@ -99,8 +99,8 @@ loudnorm --cli <フォルダ> [--method reencode|lossless|tags] [--tol 1.0] [--m
 |---|---|
 | `loudnorm-v<version>-x86_64-pc-windows-msvc.zip` | Windows x64 |
 | `loudnorm-v<version>-aarch64-pc-windows-msvc.zip` | Windows ARM64 |
-| `loudnorm-v<version>-x86_64-unknown-linux-gnu.tar.gz` | Linux x64（glibc 2.35 以降） |
-| `loudnorm-v<version>-aarch64-unknown-linux-gnu.tar.gz` | Linux ARM64（glibc 2.35 以降） |
+| `loudnorm-v<version>-x86_64-unknown-linux-gnu.tar.gz` | Linux x64（glibc 2.17 以降） |
+| `loudnorm-v<version>-aarch64-unknown-linux-gnu.tar.gz` | Linux ARM64（glibc 2.17 以降） |
 | `loudnorm-v<version>-x86_64-apple-darwin.tar.gz` | macOS Intel |
 | `loudnorm-v<version>-aarch64-apple-darwin.tar.gz` | macOS Apple シリコン |
 | `loudnorm-v<version>-src.tar.gz` / `-src.zip` | ソース |

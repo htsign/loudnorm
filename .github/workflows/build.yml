@@ -18,9 +18,10 @@ jobs:
         include:
           - { os: windows-latest, target: x86_64-pc-windows-msvc }
           - { os: windows-11-arm, target: aarch64-pc-windows-msvc }
-          # Ubuntu 22.04 keeps the glibc requirement low (2.35) so the binary runs on older distros too.
-          - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu }
-          - { os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu }
+          # Linux: link against glibc 2.17 with cargo-zigbuild, independent of the runner's own glibc,
+          # so the binary runs on old distributions and runner image upgrades do not change it.
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, glibc: "2.17" }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, glibc: "2.17" }
           - { os: macos-15-intel, target: x86_64-apple-darwin }
           - { os: macos-latest, target: aarch64-apple-darwin }
     steps:
@@ -49,8 +50,30 @@ jobs:
       - name: Test
         run: cargo test --locked --release --target ${{ matrix.target }}
 
+      - name: Install cargo-zigbuild
+        if: matrix.glibc
+        run: |
+          python3 -m venv "$RUNNER_TEMP/zigbuild"
+          "$RUNNER_TEMP/zigbuild/bin/pip" install --quiet cargo-zigbuild==0.24.1 ziglang==0.17.1
+          echo "$RUNNER_TEMP/zigbuild/bin" >> "$GITHUB_PATH"
+
       - name: Build
+        if: ${{ !matrix.glibc }}
         run: cargo build --locked --release --target ${{ matrix.target }}
+
+      - name: Build (glibc ${{ matrix.glibc }})
+        if: matrix.glibc
+        run: cargo zigbuild --locked --release --target ${{ matrix.target }}.${{ matrix.glibc }}
+
+      - name: Check required glibc
+        if: matrix.glibc
+        run: |
+          need=$(objdump -T "target/${{ matrix.target }}/release/loudnorm" | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -n1)
+          echo "highest glibc symbol version: $need (limit ${{ matrix.glibc }})"
+          if [[ "$(printf '%s\n%s\n' "$need" "${{ matrix.glibc }}" | sort -V | tail -n1)" != "${{ matrix.glibc }}" ]]; then
+            echo "::error::binary needs glibc $need, newer than ${{ matrix.glibc }}"
+            exit 1
+          fi
 
       - name: Package
         shell: bash

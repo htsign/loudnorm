@@ -22,7 +22,7 @@
   - UI の根本的な変更、計算アルゴリズムの一新などの大きな変更: メジャー（1 桁目）
   - CI やドキュメントだけの変更では上げなくてよい。
 - `main` に push され、その版のリリースがまだなければ `release.yml` が全プラットフォームをビルドして `v<version>` を Releases に登録する。
-- 配布対象は最低限 Windows x64 と Linux x64。加えて Windows ARM64、Linux ARM64、macOS（Intel / Apple シリコン）も出す。Linux は glibc 依存を下げるため Ubuntu 22.04 でビルドする。
+- 配布対象は最低限 Windows x64 と Linux x64。加えて Windows ARM64、Linux ARM64、macOS（Intel / Apple シリコン）も出す。Linux は cargo-zigbuild で glibc 2.17 を下限にリンクし、ランナーの Ubuntu の版に依存させない（CI で必要な glibc の版を検査する）。
 - 作業はブランチで行う。`main` 以外への push でも `ci.yml` が同じビルドとテストを全プラットフォームで実行する。
 
 ## 実装方針
