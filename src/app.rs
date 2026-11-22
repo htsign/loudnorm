@@ -12,12 +12,23 @@ use crate::apply::{self, ApplyOptions, Mp3Encode, Output};
 use crate::core::{self, Action, Method, PlanOptions, Stats, Target, Track};
 use crate::ffmpeg::Ffmpeg;
 use crate::settings::Settings;
+use crate::update::{self, Release, Version};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
     Idle,
     Analyzing,
     Applying,
+}
+
+/// Where the check for a newer release stands.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum UpdateState {
+    NotChecked,
+    Checking,
+    UpToDate,
+    Available(Release),
+    Failed(String),
 }
 
 struct Shared {
@@ -63,6 +74,8 @@ pub struct App {
     auto_start: bool,
     show_prefs: bool,
     show_about: bool,
+    /// Written by the update-check thread, read by the UI.
+    update: Arc<Mutex<UpdateState>>,
     /// Frame number (`Context::cumulative_frame_nr`) from which the folder picker chosen in the menu may open.
     open_folder_at: Option<u64>,
 }
@@ -295,7 +308,7 @@ impl App {
         .map_err(|e| e.to_string());
         // A folder passed on the command line (or dropped on the exe) is analysed right away.
         let arg = std::env::args().nth(1).filter(|a| std::path::Path::new(a).is_dir());
-        App {
+        let app = App {
             auto_start: arg.is_some(),
             sh: Arc::new(Mutex::new(Shared {
                 tracks: Vec::new(),
@@ -349,8 +362,37 @@ impl App {
             graph,
             show_prefs: false,
             show_about: false,
+            update: Arc::new(Mutex::new(UpdateState::NotChecked)),
             open_folder_at: None,
+        };
+        if app.check_updates {
+            app.start_update_check(&cc.egui_ctx);
         }
+        app
+    }
+
+    /// Look for a newer release on a background thread; does nothing while a check is already running.
+    fn start_update_check(&self, ctx: &egui::Context) {
+        {
+            let mut st = self.update.lock().unwrap();
+            if *st == UpdateState::Checking {
+                return;
+            }
+            *st = UpdateState::Checking;
+        }
+        let (state, ctx) = (self.update.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let result = match Version::parse(env!("CARGO_PKG_VERSION")) {
+                None => UpdateState::Failed("現在のバージョンを読み取れません".into()),
+                Some(current) => match update::fetch_latest() {
+                    Ok(r) if update::is_newer(&r.version, &current) => UpdateState::Available(r),
+                    Ok(_) => UpdateState::UpToDate,
+                    Err(e) => UpdateState::Failed(format!("{e:#}")),
+                },
+            };
+            *state.lock().unwrap() = result;
+            ctx.request_repaint();
+        });
     }
 
     fn current_settings(&self) -> Settings {
@@ -731,6 +773,17 @@ impl App {
                     self.show_about = true;
                 }
             });
+            let available = match &*self.update.lock().unwrap() {
+                UpdateState::Available(r) => Some(r.version),
+                _ => None,
+            };
+            if let Some(v) = available {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.link(RichText::new(format!("新しいバージョン v{v} があります")).color(ACCENT)).clicked() {
+                        self.show_about = true;
+                    }
+                });
+            }
         });
         open_folder
     }
@@ -743,6 +796,9 @@ impl App {
                 ui.add_space(4.0);
                 ui.label("ffmpeg");
                 self.ffmpeg_ui(ui);
+                ui.add_space(8.0);
+                ui.label("更新");
+                ui.checkbox(&mut self.check_updates, "起動時に更新を確認する");
                 ui.add_space(8.0);
                 if ui.button("閉じる").clicked() {
                     ui.close();
@@ -760,7 +816,28 @@ impl App {
             let resp = egui::Modal::new(egui::Id::unique("loudnorm-about")).show(ctx, |ui| {
                 ui.set_max_width(460.0);
                 ui.heading("loudnorm");
-                ui.label(format!("バージョン {}", env!("CARGO_PKG_VERSION")));
+                ui.label(format!("現在のバージョン {}", env!("CARGO_PKG_VERSION")));
+                ui.add_space(8.0);
+                let state = self.update.lock().unwrap().clone();
+                match &state {
+                    UpdateState::NotChecked => {}
+                    UpdateState::Checking => {
+                        ui.label("確認中…");
+                    }
+                    UpdateState::UpToDate => {
+                        ui.label("最新版です");
+                    }
+                    UpdateState::Available(r) => {
+                        ui.label(RichText::new(format!("現在 {} → 最新 {}", env!("CARGO_PKG_VERSION"), r.version)).strong().color(ACCENT));
+                        ui.hyperlink_to("リリースページを開く", &r.url);
+                    }
+                    UpdateState::Failed(e) => {
+                        ui.label(RichText::new(format!("確認できませんでした: {e}")).color(WARN));
+                    }
+                }
+                if ui.add_enabled(state != UpdateState::Checking, egui::Button::new("更新を確認")).clicked() {
+                    self.start_update_check(ctx);
+                }
                 ui.add_space(8.0);
                 if ui.button("閉じる").clicked() {
                     ui.close();

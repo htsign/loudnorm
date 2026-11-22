@@ -7,6 +7,7 @@ mod core;
 mod ffmpeg;
 mod lossless;
 mod settings;
+mod update;
 
 use std::path::PathBuf;
 

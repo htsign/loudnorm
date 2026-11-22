@@ -13,6 +13,7 @@
 | `src/lossless.rs` | 無劣化の補正（MP3 global_gain、Opus ヘッダゲイン）と MP3 のタグ位置の判定 |
 | `src/ffmpeg.rs` | ffmpeg / ffprobe の検出と実行 |
 | `src/settings.rs` | 設定ファイル（INI）の読み書き |
+| `src/update.rs` | 更新の確認（GitHub Releases の最新版の取得と版の比較） |
 
 ## バージョンとリリース
 
