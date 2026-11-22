@@ -62,8 +62,8 @@ pub struct App {
     auto_start: bool,
     show_prefs: bool,
     show_about: bool,
-    /// Frames left before the folder picker opened from the menu is shown (0: none pending).
-    open_folder_wait: u8,
+    /// Frame number (`Context::cumulative_frame_nr`) from which the folder picker chosen in the menu may open.
+    open_folder_at: Option<u64>,
 }
 
 const ACCENT: Color32 = Color32::from_rgb(64, 120, 242);
@@ -347,7 +347,7 @@ impl App {
             graph,
             show_prefs: false,
             show_about: false,
-            open_folder_wait: 0,
+            open_folder_at: None,
         }
     }
 
@@ -747,7 +747,7 @@ impl App {
             });
             if resp.should_close() {
                 self.show_prefs = false;
-                // Closing by Escape / backdrop must not leave a typed location saved but unused this session.
+                // Whichever way the dialog is closed, a typed location must not stay saved but unused this session.
                 if self.ff_hint.trim() != self.ff_located_hint {
                     self.relocate_ffmpeg();
                 }
@@ -786,10 +786,14 @@ impl eframe::App for App {
         }
         self.autosave(&ctx);
         // The picker blocks the UI thread, so open it only after the menu has been painted closed; otherwise the open menu stays frozen on screen.
-        if self.open_folder_wait > 0 {
-            self.open_folder_wait -= 1;
-            if self.open_folder_wait == 0 {
-                self.pick_folder_and_analyze(&ctx);
+        // Count painted frames, not ui() calls: a frame may run ui() more than once (request_discard).
+        if let Some(at) = self.open_folder_at {
+            if ctx.cumulative_frame_nr() >= at {
+                self.open_folder_at = None;
+                // Something may have started in the frame in between (e.g. 解析 was clicked); do not open the picker while busy.
+                if self.sh.lock().unwrap().phase == Phase::Idle {
+                    self.pick_folder_and_analyze(&ctx);
+                }
             } else {
                 ctx.request_repaint();
             }
@@ -809,7 +813,7 @@ impl eframe::App for App {
 
         egui::Panel::top("menubar").show(ui, |ui| {
             if self.menu_bar_ui(ui, &ctx, busy) {
-                self.open_folder_wait = 2;
+                self.open_folder_at = Some(ctx.cumulative_frame_nr() + 2);
                 ctx.request_repaint();
             }
         });
