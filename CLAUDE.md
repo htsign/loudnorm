@@ -7,7 +7,7 @@
 | ファイル | 役割 |
 |---|---|
 | `src/main.rs` | 起動、ウィンドウ設定、`--cli`（テスト・スクリプト用） |
-| `src/app.rs` | egui の画面（設定欄、グラフ、一覧、確認ダイアログ） |
+| `src/app.rs` | egui の画面（メニューバー、環境設定・バージョン情報のダイアログ、設定欄、グラフ、一覧、確認ダイアログ） |
 | `src/core.rs` | 走査、ラウドネス解析（symphonia + ebur128、失敗時 ffmpeg）、統計と補正計画 |
 | `src/apply.rs` | 補正の適用（ffmpeg で再エンコード、タグの引き継ぎ、バックアップ） |
 | `src/lossless.rs` | 無劣化の補正（MP3 global_gain、Opus ヘッダゲイン）と MP3 のタグ位置の判定 |

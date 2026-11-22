@@ -35,6 +35,8 @@ pub struct App {
     cancel: Arc<AtomicBool>,
     root: String,
     ff_hint: String,
+    /// The trimmed hint that `ff` was detected with; differs from `ff_hint` while a typed location is not yet applied.
+    ff_located_hint: String,
     ff: Result<Ffmpeg, String>,
     po: PlanOptions,
     mp3: Mp3Encode,
@@ -58,6 +60,10 @@ pub struct App {
     stats: Option<Stats>,
     graph: GraphView,
     auto_start: bool,
+    show_prefs: bool,
+    show_about: bool,
+    /// Frames left before the folder picker opened from the menu is shown (0: none pending).
+    open_folder_wait: u8,
 }
 
 const ACCENT: Color32 = Color32::from_rgb(64, 120, 242);
@@ -307,6 +313,7 @@ impl App {
             })),
             cancel: Arc::new(AtomicBool::new(false)),
             root: arg.unwrap_or_else(|| st.last_folder.clone()),
+            ff_located_hint: ff_hint.trim().to_string(),
             ff_hint,
             ff,
             po: PlanOptions {
@@ -338,6 +345,9 @@ impl App {
             confirm: false,
             stats: None,
             graph,
+            show_prefs: false,
+            show_about: false,
+            open_folder_wait: 0,
         }
     }
 
@@ -638,6 +648,126 @@ impl App {
         });
     }
 
+    /// Ask for a folder and analyse it.
+    fn pick_folder_and_analyze(&mut self, ctx: &egui::Context) {
+        if let Some(p) = rfd::FileDialog::new().pick_folder() {
+            self.root = p.display().to_string();
+            self.start_analyze(ctx);
+        }
+    }
+
+    /// ffmpeg location: status, hint field, folder / file pickers and re-detection.
+    fn ffmpeg_ui(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            match &self.ff {
+                Ok(f) => ui.label(RichText::new(format!("ffmpeg: {}", f.ffmpeg.display())).small().weak()).on_hover_text(&f.version),
+                Err(e) => ui.label(RichText::new(format!("⚠ {e}")).small().color(WARN)),
+            };
+        });
+        ui.horizontal(|ui| {
+            ui.add(egui::TextEdit::singleline(&mut self.ff_hint).desired_width(260.0).hint_text("ffmpeg の場所（任意）"));
+            let mut relocate = false;
+            if ui.small_button("フォルダ…").on_hover_text("ffmpeg と ffprobe があるフォルダを選ぶ").clicked() {
+                if let Some(p) = rfd::FileDialog::new().set_title("ffmpeg のあるフォルダ").pick_folder() {
+                    self.ff_hint = p.display().to_string();
+                    relocate = true;
+                }
+            }
+            if ui.small_button("ファイル…").on_hover_text("ffmpeg の実行ファイルを選ぶ").clicked() {
+                let mut d = rfd::FileDialog::new().set_title("ffmpeg の実行ファイル");
+                if cfg!(windows) {
+                    d = d.add_filter("ffmpeg.exe", &["exe"]);
+                }
+                if let Some(p) = d.pick_file() {
+                    self.ff_hint = p.display().to_string();
+                    relocate = true;
+                }
+            }
+            if ui.small_button("再検出").clicked() || relocate {
+                self.relocate_ffmpeg();
+            }
+        });
+    }
+
+    /// Detect ffmpeg again from the current hint (an empty hint falls back to the default search).
+    fn relocate_ffmpeg(&mut self) {
+        let hint = self.ff_hint.trim().to_string();
+        self.ff = Ffmpeg::locate(Some(std::path::Path::new(&hint))).map_err(|e| e.to_string());
+        self.ff_located_hint = hint;
+        let msg = match &self.ff {
+            Ok(f) => format!("ffmpeg: {}", f.ffmpeg.display()),
+            Err(e) => e.clone(),
+        };
+        self.log(msg);
+    }
+
+    /// Draws the menu bar; returns true when フォルダを開く… was chosen (the blocking picker is opened by the caller after the menu is drawn).
+    fn menu_bar_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, busy: bool) -> bool {
+        let mut open_folder = false;
+        egui::MenuBar::new().ui(ui, |ui| {
+            ui.menu_button("ファイル", |ui| {
+                if ui.add_enabled(!busy, egui::Button::new("フォルダを開く…")).clicked() {
+                    ui.close();
+                    open_folder = true;
+                }
+                ui.separator();
+                if ui.add_enabled(!busy, egui::Button::new("終了")).clicked() {
+                    ui.close();
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            });
+            ui.menu_button("設定", |ui| {
+                if ui.button("環境設定…").clicked() {
+                    ui.close();
+                    self.show_prefs = true;
+                }
+            });
+            ui.menu_button("ヘルプ", |ui| {
+                if ui.button("バージョン情報…").clicked() {
+                    ui.close();
+                    self.show_about = true;
+                }
+            });
+        });
+        open_folder
+    }
+
+    fn dialogs_ui(&mut self, ctx: &egui::Context) {
+        if self.show_prefs {
+            let resp = egui::Modal::new(egui::Id::unique("loudnorm-prefs")).show(ctx, |ui| {
+                ui.set_max_width(460.0);
+                ui.heading("環境設定");
+                ui.add_space(4.0);
+                ui.label("ffmpeg");
+                self.ffmpeg_ui(ui);
+                ui.add_space(8.0);
+                if ui.button("閉じる").clicked() {
+                    ui.close();
+                }
+            });
+            if resp.should_close() {
+                self.show_prefs = false;
+                // Closing by Escape / backdrop must not leave a typed location saved but unused this session.
+                if self.ff_hint.trim() != self.ff_located_hint {
+                    self.relocate_ffmpeg();
+                }
+            }
+        }
+        if self.show_about {
+            let resp = egui::Modal::new(egui::Id::unique("loudnorm-about")).show(ctx, |ui| {
+                ui.set_max_width(460.0);
+                ui.heading("loudnorm");
+                ui.label(format!("バージョン {}", env!("CARGO_PKG_VERSION")));
+                ui.add_space(8.0);
+                if ui.button("閉じる").clicked() {
+                    ui.close();
+                }
+            });
+            if resp.should_close() {
+                self.show_about = false;
+            }
+        }
+    }
 }
 
 impl eframe::App for App {
@@ -655,6 +785,15 @@ impl eframe::App for App {
             }
         }
         self.autosave(&ctx);
+        // The picker blocks the UI thread, so open it only after the menu has been painted closed; otherwise the open menu stays frozen on screen.
+        if self.open_folder_wait > 0 {
+            self.open_folder_wait -= 1;
+            if self.open_folder_wait == 0 {
+                self.pick_folder_and_analyze(&ctx);
+            } else {
+                ctx.request_repaint();
+            }
+        }
         if std::mem::take(&mut self.auto_start) {
             self.start_analyze(&ctx);
         }
@@ -668,6 +807,13 @@ impl eframe::App for App {
             self.stats = core::plan(&mut s.tracks, &self.po);
         }
 
+        egui::Panel::top("menubar").show(ui, |ui| {
+            if self.menu_bar_ui(ui, &ctx, busy) {
+                self.open_folder_wait = 2;
+                ctx.request_repaint();
+            }
+        });
+
         egui::Panel::top("top").show(ui, |ui| {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
@@ -677,10 +823,7 @@ impl eframe::App for App {
                     egui::TextEdit::singleline(&mut self.root).desired_width(ui.available_width() - 260.0).hint_text("曲が入ったフォルダ（サブフォルダも対象）"),
                 );
                 if ui.add_enabled(!busy, egui::Button::new("選択…")).clicked() {
-                    if let Some(p) = rfd::FileDialog::new().pick_folder() {
-                        self.root = p.display().to_string();
-                        self.start_analyze(&ctx);
-                    }
+                    self.pick_folder_and_analyze(&ctx);
                 }
                 if ui.add_enabled(!busy && !self.root.trim().is_empty(), egui::Button::new(RichText::new("解析").strong())).clicked() {
                     self.start_analyze(&ctx);
@@ -689,39 +832,14 @@ impl eframe::App for App {
                     self.cancel.store(true, Ordering::SeqCst);
                 }
             });
-            ui.horizontal(|ui| {
-                match &self.ff {
-                    Ok(f) => ui.label(RichText::new(format!("ffmpeg: {}", f.ffmpeg.display())).small().weak()).on_hover_text(&f.version),
-                    Err(e) => ui.label(RichText::new(format!("⚠ {e}")).small().color(WARN)),
-                };
-                ui.add(egui::TextEdit::singleline(&mut self.ff_hint).desired_width(260.0).hint_text("ffmpeg の場所（任意）"));
-                let mut relocate = false;
-                if ui.small_button("フォルダ…").on_hover_text("ffmpeg と ffprobe があるフォルダを選ぶ").clicked() {
-                    if let Some(p) = rfd::FileDialog::new().set_title("ffmpeg のあるフォルダ").pick_folder() {
-                        self.ff_hint = p.display().to_string();
-                        relocate = true;
+            if let Err(e) = &self.ff {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(format!("⚠ {e}")).small().color(WARN));
+                    if ui.link(RichText::new("環境設定を開く").small()).clicked() {
+                        self.show_prefs = true;
                     }
-                }
-                if ui.small_button("ファイル…").on_hover_text("ffmpeg の実行ファイルを選ぶ").clicked() {
-                    let mut d = rfd::FileDialog::new().set_title("ffmpeg の実行ファイル");
-                    if cfg!(windows) {
-                        d = d.add_filter("ffmpeg.exe", &["exe"]);
-                    }
-                    if let Some(p) = d.pick_file() {
-                        self.ff_hint = p.display().to_string();
-                        relocate = true;
-                    }
-                }
-                if ui.small_button("再検出").clicked() || relocate {
-                    let h = PathBuf::from(self.ff_hint.trim());
-                    self.ff = Ffmpeg::locate(Some(&h)).map_err(|e| e.to_string());
-                    let msg = match &self.ff {
-                        Ok(f) => format!("ffmpeg: {}", f.ffmpeg.display()),
-                        Err(e) => e.clone(),
-                    };
-                    self.log(msg);
-                }
-            });
+                });
+            }
             if busy {
                 let label = if phase == Phase::Analyzing { "解析中" } else { "適用中" };
                 ui.add(egui::ProgressBar::new(if total > 0 { done as f32 / total as f32 } else { 0.0 }).text(format!("{label} {done} / {total}")));
@@ -908,6 +1026,8 @@ impl eframe::App for App {
                 self.col_w = measured;
             }
         });
+
+        self.dialogs_ui(&ctx);
 
         if self.confirm {
             let (n, dest) = {
