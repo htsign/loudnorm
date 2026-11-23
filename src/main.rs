@@ -13,6 +13,9 @@ use std::path::PathBuf;
 
 use rayon::prelude::*;
 
+/// Window icon; also the 256 px entry of `assets/icon.ico`.
+const ICON_PNG: &[u8] = include_bytes!("../assets/icon-256.png");
+
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(String::as_str) == Some("--cli") {
@@ -24,12 +27,16 @@ fn main() -> anyhow::Result<()> {
         return cli(&args[2..]);
     }
     let (st, msg) = settings::Settings::load();
+    let icon = eframe::icon_data::from_png_bytes(ICON_PNG)?;
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([st.window_width, st.window_height])
             .with_maximized(st.window_maximized)
             .with_min_inner_size([760.0, 480.0])
-            .with_title("loudnorm"),
+            .with_title("loudnorm")
+            // Wayland compositors ignore the window icon and look the icon up from the .desktop file named after this ID.
+            .with_app_id("loudnorm")
+            .with_icon(icon),
         ..Default::default()
     };
     eframe::run_native("loudnorm", options, Box::new(move |cc| Ok(Box::new(app::App::new(cc, st, msg)))))
@@ -126,4 +133,104 @@ fn cli(args: &[String]) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ICON_ICO: &[u8] = include_bytes!("../assets/icon.ico");
+    const ICON_ICNS: &[u8] = include_bytes!("../assets/icon.icns");
+
+    /// Splits an .ico into (size in px, image data) per directory entry; a width byte of 0 means 256.
+    fn ico_entries(ico: &[u8]) -> Vec<(u32, &[u8])> {
+        let count = u16::from_le_bytes([ico[4], ico[5]]) as usize;
+        (0..count)
+            .map(|i| {
+                let e = &ico[6 + 16 * i..6 + 16 * (i + 1)];
+                let size = if e[0] == 0 { 256 } else { u32::from(e[0]) };
+                let len = u32::from_le_bytes([e[8], e[9], e[10], e[11]]) as usize;
+                let off = u32::from_le_bytes([e[12], e[13], e[14], e[15]]) as usize;
+                (size, &ico[off..off + len])
+            })
+            .collect()
+    }
+
+    /// Splits an .icns into (OSType, image data) per entry. Numbers are big-endian and lengths include the 8-byte header.
+    fn icns_entries(icns: &[u8]) -> Vec<(String, &[u8])> {
+        assert_eq!(&icns[..4], b"icns");
+        let total = u32::from_be_bytes([icns[4], icns[5], icns[6], icns[7]]) as usize;
+        assert_eq!(total, icns.len(), "the header length must cover the whole file");
+        let mut entries = Vec::new();
+        let mut at = 8;
+        while at < icns.len() {
+            let len = u32::from_be_bytes([icns[at + 4], icns[at + 5], icns[at + 6], icns[at + 7]]) as usize;
+            entries.push((String::from_utf8(icns[at..at + 4].to_vec()).unwrap(), &icns[at + 8..at + len]));
+            at += len;
+        }
+        assert_eq!(at, icns.len(), "the last entry must end exactly at the end of the file");
+        entries
+    }
+
+    #[test]
+    fn embedded_window_icon_decodes_to_256px_square() {
+        let icon = eframe::icon_data::from_png_bytes(ICON_PNG).expect("icon-256.png must decode");
+
+        assert_eq!((icon.width, icon.height), (256, 256));
+    }
+
+    #[test]
+    fn exe_icon_has_every_size_windows_picks_from() {
+        let mut sizes: Vec<u32> = ico_entries(ICON_ICO).iter().map(|(size, _)| *size).collect();
+        sizes.sort_unstable();
+
+        assert_eq!(sizes, [16, 20, 24, 32, 40, 48, 64, 256]);
+    }
+
+    #[test]
+    fn exe_icon_entries_are_png_of_their_listed_size() {
+        for (size, data) in ico_entries(ICON_ICO) {
+            assert_eq!(&data[..8], b"\x89PNG\r\n\x1a\n", "{size} px entry must be a PNG");
+            let width = u32::from_be_bytes([data[16], data[17], data[18], data[19]]);
+            let height = u32::from_be_bytes([data[20], data[21], data[22], data[23]]);
+            assert_eq!((width, height), (size, size), "{size} px entry has a different PNG size");
+        }
+    }
+
+    #[test]
+    fn exe_icon_256px_entry_is_the_window_icon() {
+        let entries = ico_entries(ICON_ICO);
+
+        let (_, png) = entries.iter().find(|(size, _)| *size == 256).expect("256 px entry");
+        assert_eq!(*png, ICON_PNG);
+    }
+
+    #[test]
+    fn app_bundle_icon_has_png_entries_of_the_size_their_type_names() {
+        let mut got: Vec<(String, u32)> = icns_entries(ICON_ICNS)
+            .iter()
+            .map(|(kind, data)| {
+                assert_eq!(&data[..8], b"\x89PNG\r\n\x1a\n", "{kind} must be a PNG");
+                let width = u32::from_be_bytes([data[16], data[17], data[18], data[19]]);
+                let height = u32::from_be_bytes([data[20], data[21], data[22], data[23]]);
+                assert_eq!(width, height, "{kind} must be square");
+                (kind.clone(), width)
+            })
+            .collect();
+        got.sort();
+
+        // ic07-ic10 are 128-512 pt at 1x (ic10 is 512 pt at 2x); ic11-ic14 are 16-256 pt at 2x.
+        let want = [("ic07", 128), ("ic08", 256), ("ic09", 512), ("ic10", 1024), ("ic11", 32), ("ic12", 64), ("ic13", 256), ("ic14", 512)];
+        assert_eq!(got, want.map(|(kind, px)| (kind.to_string(), px)));
+    }
+
+    #[test]
+    fn app_bundle_icon_256px_entries_are_the_window_icon() {
+        let entries = icns_entries(ICON_ICNS);
+
+        for want in ["ic08", "ic13"] {
+            let (_, png) = entries.iter().find(|(kind, _)| kind == want).unwrap_or_else(|| panic!("{want} entry"));
+            assert_eq!(*png, ICON_PNG, "{want} must be the window icon");
+        }
+    }
 }

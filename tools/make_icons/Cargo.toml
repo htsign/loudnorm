@@ -1,0 +1,13 @@
+[package]
+name = "make_icons"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Regenerates assets/icon.ico, assets/icon.icns and assets/icon-256.png from the SVG sources."
+
+# Makes this package its own workspace root, so it never joins a workspace of the main package and `cargo build` at the
+# repository root never compiles it.
+[workspace]
+
+[dependencies]
+resvg = { version = "0.50", default-features = false }

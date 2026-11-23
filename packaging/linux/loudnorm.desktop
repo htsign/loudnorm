@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=loudnorm
+Comment=Measure the loudness of the songs in a folder and correct only the ones that are off target
+Comment[ja]=フォルダ内の曲のラウドネスを測り、目標から外れた曲だけを補正する
+Exec=loudnorm %f
+Icon=loudnorm
+Categories=AudioVideo;Audio;
+Keywords=loudness;volume;normalize;EBU R128;ReplayGain;
+StartupWMClass=loudnorm
+Terminal=false
