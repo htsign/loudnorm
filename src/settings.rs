@@ -21,7 +21,7 @@ pub struct Settings {
     pub lossless_fallback_reencode: bool,
     pub target: Target,
     pub custom_target: f64,
-    pub histogram: bool,
+    pub density: bool,
     pub mp3: Mp3Encode,
     pub aac_kbps: u32,
     pub vorbis_q: u32,
@@ -59,7 +59,7 @@ impl Default for Settings {
             lossless_fallback_reencode: false,
             target: Target::Median,
             custom_target: -16.0,
-            histogram: false,
+            density: false,
             mp3: Mp3Encode::Cbr320,
             aac_kbps: 256,
             vorbis_q: 8,
@@ -154,8 +154,8 @@ impl Settings {
              width = {}\n\
              height = {}\n\
              maximized = {}\n\
-             ; 上部のグラフをヒストグラムで表示するか\n\
-             histogram = {}\n\
+             ; 上部のグラフの表示: dots（各曲の点）| density（分布曲線）\n\
+             graph = {}\n\
              \n\
              [table]\n\
              ; フォルダ, ファイル名, 形式, LUFS, 中央値差, ピーク, 補正, 処理 の列幅\n\
@@ -181,7 +181,7 @@ impl Settings {
             self.window_width,
             self.window_height,
             self.window_maximized,
-            self.histogram,
+            if self.density { "density" } else { "dots" },
             self.column_widths.iter().map(|w| format!("{w}")).collect::<Vec<_>>().join(", "),
         )
     }
@@ -256,7 +256,11 @@ impl Settings {
         take!("window.width", s.window_width, size);
         take!("window.height", s.window_height, size);
         take!("window.maximized", s.window_maximized, b);
-        take!("window.histogram", s.histogram, b);
+        take!("window.graph", s.density, |v: &str| match v {
+            "dots" => Some(false),
+            "density" => Some(true),
+            _ => None,
+        });
         take!("table.column_widths", s.column_widths, |v: &str| {
             let ws: Option<Vec<f32>> = v.split(',').map(|x| x.trim().parse::<f32>().ok().filter(|w| (20.0..=4000.0).contains(w))).collect();
             ws.filter(|ws| ws.len() == DEFAULT_COLUMN_WIDTHS.len())
@@ -308,7 +312,7 @@ mod tests {
             lossless_fallback_reencode: true,
             target: Target::MinChange,
             custom_target: -14.5,
-            histogram: true,
+            density: true,
             mp3: Mp3Encode::V0,
             aac_kbps: 320,
             vorbis_q: 6,
@@ -346,6 +350,56 @@ mod tests {
             .skip(1)
             .take_while(|l| !l.starts_with('['))
             .collect()
+    }
+
+    #[test]
+    fn density_view_is_saved_as_graph_density_and_read_back() {
+        let s = Settings { density: true, ..Default::default() };
+
+        let ini = s.to_ini();
+        let (r, bad) = Settings::from_ini(&ini);
+
+        assert!(section_lines(&ini, "window").contains(&"graph = density"), "{ini}");
+        assert!(!section_lines(&ini, "window").iter().any(|l| l.starts_with("histogram")), "{ini}");
+        assert!(bad.is_empty(), "{bad:?}");
+        assert!(r.density);
+    }
+
+    #[test]
+    fn dots_view_is_saved_as_graph_dots_and_read_back() {
+        let s = Settings::default();
+
+        let ini = s.to_ini();
+        let (r, bad) = Settings::from_ini(&ini);
+
+        assert!(section_lines(&ini, "window").contains(&"graph = dots"), "{ini}");
+        assert!(!section_lines(&ini, "window").iter().any(|l| l.starts_with("histogram")), "{ini}");
+        assert!(bad.is_empty(), "{bad:?}");
+        assert!(!r.density);
+    }
+
+    #[test]
+    fn graph_density_in_window_section_selects_density_view() {
+        let (r, bad) = Settings::from_ini("[window]\ngraph = density\n");
+
+        assert!(bad.is_empty(), "{bad:?}");
+        assert!(r.density);
+    }
+
+    #[test]
+    fn unknown_graph_view_is_reported_and_keeps_default() {
+        let (r, bad) = Settings::from_ini("[window]\ngraph = bars\n");
+
+        assert_eq!(bad, vec!["window.graph".to_string()]);
+        assert_eq!(r, Settings::default());
+    }
+
+    #[test]
+    fn legacy_histogram_key_is_ignored_silently() {
+        let (r, bad) = Settings::from_ini("[window]\nhistogram = true\n");
+
+        assert!(bad.is_empty(), "{bad:?}");
+        assert_eq!(r, Settings::default());
     }
 
     #[test]

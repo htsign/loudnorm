@@ -403,6 +403,46 @@ pub fn stats(sorted: &[f64], tolerance: f64) -> Stats {
     }
 }
 
+/// Silverman's rule-of-thumb kernel bandwidth (dB) for `values` (ascending): 0.9 * min(stdev, IQR / 1.34) * n^(-1/5).
+/// A zero spread measure is skipped in the min; 0.5 dB when no spread is left (fewer than two values or all equal).
+pub fn silverman_bandwidth(values: &[f64]) -> f64 {
+    const FALLBACK: f64 = 0.5;
+    debug_assert!(values.is_sorted(), "values must be ascending");
+    let n = values.len();
+    if n < 2 || values[0] == values[n - 1] {
+        return FALLBACK;
+    }
+    let mean = values.iter().sum::<f64>() / n as f64;
+    let stdev = (values.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1) as f64).sqrt();
+    let iqr = (percentile(values, 0.75) - percentile(values, 0.25)) / 1.34;
+    match [stdev, iqr].into_iter().filter(|s| *s > 0.0).min_by(f64::total_cmp) {
+        Some(spread) => 0.9 * spread * (n as f64).powf(-0.2),
+        None => FALLBACK,
+    }
+}
+
+/// Gaussian kernel density estimate at `x`: the mean of N(v, h) pdfs over `values` (ascending, for the cutoff search).
+/// Values farther than 8 bandwidths from `x` are ignored (they contribute less than 1e-13 of a kernel peak);
+/// values exactly 8 bandwidths away are included. Empty `values` give 0. `h` must be positive.
+pub fn kde_density(values: &[f64], h: f64, x: f64) -> f64 {
+    debug_assert!(h > 0.0, "bandwidth must be positive");
+    if values.is_empty() {
+        return 0.0;
+    }
+    let reach = 8.0 * h;
+    let from = values.partition_point(|v| *v < x - reach);
+    let to = values.partition_point(|v| *v <= x + reach);
+    let sum: f64 = values[from..to].iter().map(|v| (-0.5 * ((x - v) / h).powi(2)).exp()).sum();
+    sum / (values.len() as f64 * h * (2.0 * std::f64::consts::PI).sqrt())
+}
+
+/// Bandwidth used to draw the density curve over [lo, hi] sampled at `steps` intervals: the estimate `h`,
+/// but never narrower than one sample interval so a peak cannot fall between samples.
+pub fn display_bandwidth(h: f64, lo: f64, hi: f64, steps: usize) -> f64 {
+    debug_assert!(steps > 0, "steps must be positive");
+    h.max((hi - lo) / steps as f64)
+}
+
 pub const RG2_REFERENCE: f64 = -18.0;
 
 /// Fill `want`, `gain`, `action`, `note` for every track. Returns the loudness statistics (with the target used).
@@ -540,5 +580,145 @@ mod tests {
         let s = stats(&v, 1.0);
         assert_eq!(s.min_change_kept, 3);
         assert!(s.min_change < -18.0);
+    }
+
+    fn assert_close(actual: f64, expected: f64) {
+        assert!((actual - expected).abs() <= 1e-9 * expected.abs(), "actual {actual}, expected {expected}");
+    }
+
+    #[test]
+    fn silverman_uses_iqr_when_it_is_smaller_than_stdev() {
+        // Type 7 quartiles -19.75 / -18.125 (IQR 1.625, /1.34 = 1.21); sample stdev sqrt(40.775) = 6.39.
+        let v = [-30.0, -20.0, -19.0, -18.5, -18.0, -10.0];
+
+        let h = silverman_bandwidth(&v);
+
+        assert_close(h, 0.9 * (1.625 / 1.34) * 6f64.powf(-0.2));
+    }
+
+    #[test]
+    fn silverman_uses_stdev_when_it_is_smaller_than_iqr() {
+        // Type 7 quartiles -20 / -10 (IQR 10, /1.34 = 7.46); sample stdev sqrt(100 / 3) = 5.77.
+        let v = [-20.0, -20.0, -10.0, -10.0];
+
+        let h = silverman_bandwidth(&v);
+
+        assert_close(h, 0.9 * (100.0f64 / 3.0).sqrt() * 4f64.powf(-0.2));
+    }
+
+    #[test]
+    fn silverman_uses_stdev_when_iqr_is_zero() {
+        // Both quartiles are -20; sample stdev sqrt(80 / 4) = sqrt(20).
+        let v = [-20.0, -20.0, -20.0, -20.0, -10.0];
+
+        let h = silverman_bandwidth(&v);
+
+        assert_close(h, 0.9 * 20f64.sqrt() * 5f64.powf(-0.2));
+    }
+
+    #[test]
+    fn silverman_falls_back_to_half_db_for_fewer_than_two_values() {
+        assert_eq!(silverman_bandwidth(&[]), 0.5);
+        assert_eq!(silverman_bandwidth(&[-14.0]), 0.5);
+    }
+
+    #[test]
+    fn silverman_computes_bandwidth_from_two_distinct_values() {
+        // Type 7 quartiles -17.5 / -12.5 (IQR 5, /1.34 = 3.73); sample stdev sqrt(50) = 7.07.
+        let v = [-20.0, -10.0];
+
+        let h = silverman_bandwidth(&v);
+
+        assert_close(h, 0.9 * (5.0 / 1.34) * 2f64.powf(-0.2));
+    }
+
+    #[test]
+    fn silverman_falls_back_to_half_db_when_all_values_are_equal() {
+        // -29.9 is not exact in binary, so a naive mean leaves a stdev of about 4e-15 instead of 0.
+        let v = [-29.9, -29.9, -29.9];
+
+        let h = silverman_bandwidth(&v);
+
+        assert_eq!(h, 0.5);
+    }
+
+    fn normal_pdf(mean: f64, sd: f64, x: f64) -> f64 {
+        (-0.5 * ((x - mean) / sd).powi(2)).exp() / (sd * (2.0 * std::f64::consts::PI).sqrt())
+    }
+
+    #[test]
+    fn kde_of_one_value_is_the_normal_pdf_around_it() {
+        let (v, h) = (-14.0, 0.5);
+
+        let at_center = kde_density(&[v], h, v);
+        let off_center = kde_density(&[v], h, -13.2);
+
+        assert_close(at_center, normal_pdf(v, h, v));
+        assert_close(off_center, normal_pdf(v, h, -13.2));
+    }
+
+    #[test]
+    fn kde_of_two_values_is_the_mean_of_their_normal_pdfs() {
+        let (a, b, h, x) = (-16.0, -13.0, 0.5, -14.2);
+
+        let d = kde_density(&[a, b], h, x);
+
+        assert_close(d, (normal_pdf(a, h, x) + normal_pdf(b, h, x)) / 2.0);
+    }
+
+    #[test]
+    fn kde_of_several_values_integrates_to_one() {
+        let v = [-20.0, -15.0, -14.5, -9.0];
+        let h = 0.8;
+        let (a, b, steps) = (-20.0 - 6.0 * h, -9.0 + 6.0 * h, 20_000usize);
+        let dx = (b - a) / steps as f64;
+
+        let ys: Vec<f64> = (0..=steps).map(|i| kde_density(&v, h, a + i as f64 * dx)).collect();
+
+        let area = dx * (ys.iter().sum::<f64>() - (ys[0] + ys[steps]) / 2.0);
+        assert!((area - 1.0).abs() < 1e-3, "area {area}");
+    }
+
+    #[test]
+    fn kde_includes_a_value_exactly_eight_bandwidths_away() {
+        let d = kde_density(&[0.0], 1.0, 8.0);
+
+        assert_close(d, normal_pdf(0.0, 1.0, 8.0));
+    }
+
+    #[test]
+    fn kde_ignores_a_value_just_beyond_eight_bandwidths() {
+        let d = kde_density(&[0.0], 1.0, 8.0 + 1e-9);
+
+        assert_eq!(d, 0.0);
+    }
+
+    #[test]
+    fn kde_of_no_values_is_zero() {
+        assert_eq!(kde_density(&[], 1.0, 0.0), 0.0);
+    }
+
+    #[test]
+    fn display_bandwidth_keeps_an_estimate_wider_than_the_grid() {
+        // Grid spacing (-5 - -30) / 500 = 0.05.
+        let h = display_bandwidth(0.9, -30.0, -5.0, 500);
+
+        assert_close(h, 0.9);
+    }
+
+    #[test]
+    fn display_bandwidth_widens_an_estimate_narrower_than_the_grid() {
+        // Grid spacing (-5 - -30) / 500 = 0.05.
+        let h = display_bandwidth(0.0005, -30.0, -5.0, 500);
+
+        assert_close(h, 0.05);
+    }
+
+    #[test]
+    fn display_bandwidth_keeps_an_estimate_equal_to_the_grid() {
+        // Grid spacing (1 - 0) / 4 = 0.25, exact in binary.
+        let h = display_bandwidth(0.25, 0.0, 1.0, 4);
+
+        assert_close(h, 0.25);
     }
 }
