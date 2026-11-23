@@ -1,5 +1,6 @@
 # Reusable: test, build and package loudnorm for every supported platform.
-# Each job uploads one artifact named "loudnorm-<target>" holding a .zip (Windows) or .tar.gz.
+# Each job uploads one artifact named "loudnorm-<target>" holding a .zip (Windows: exe + README; macOS: loudnorm.app
+# + README) or an .AppImage (Linux).
 name: Build
 
 on:
@@ -7,6 +8,13 @@ on:
 
 permissions:
   contents: read
+
+env:
+  # Tools that build the Linux AppImage, pinned to released versions; the sha256 of each download is in the matrix below.
+  # appimagetool downloads its runtime unless one is given, so the runtime is pinned as well and passed with --runtime-file.
+  # The type 2 runtime is a static executable: it adds no glibc requirement and needs no libfuse2 on the user's machine.
+  APPIMAGETOOL_VERSION: "1.9.1"
+  TYPE2_RUNTIME_VERSION: "20251108"
 
 jobs:
   build:
@@ -20,8 +28,18 @@ jobs:
           - { os: windows-11-arm, target: aarch64-pc-windows-msvc }
           # Linux: link against glibc 2.17 with cargo-zigbuild, independent of the runner's own glibc,
           # so the binary runs on old distributions and runner image upgrades do not change it.
-          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, glibc: "2.17" }
-          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, glibc: "2.17" }
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            glibc: "2.17"
+            appimage_arch: x86_64
+            appimagetool_sha256: ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0
+            runtime_sha256: 2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            glibc: "2.17"
+            appimage_arch: aarch64
+            appimagetool_sha256: f0837e7448a0c1e4e650a93bb3e85802546e60654ef287576f46c71c126a9158
+            runtime_sha256: 00cbdfcf917cc6c0ff6d3347d59e0ca1f7f45a6df1a428a0d6d8a78664d87444
           - { os: macos-15-intel, target: x86_64-apple-darwin }
           - { os: macos-latest, target: aarch64-apple-darwin }
     steps:
@@ -75,21 +93,100 @@ jobs:
             exit 1
           fi
 
-      - name: Package
+      - name: Package name
+        id: pkg
         shell: bash
         run: |
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
-          name="loudnorm-v${version}-${{ matrix.target }}"
+          echo "name=loudnorm-v${version}-${{ matrix.target }}" >> "$GITHUB_OUTPUT"
+          # CFBundleVersion and CFBundleShortVersionString take up to three dot-separated integers: drop any -pre / +build part.
+          echo "bundle_version=${version%%[-+]*}" >> "$GITHUB_OUTPUT"
+
+      - name: Package (Windows zip)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          name="${{ steps.pkg.outputs.name }}"
           mkdir -p "dist/$name"
-          if [[ "$RUNNER_OS" == "Windows" ]]; then exe=loudnorm.exe; else exe=loudnorm; fi
-          cp "target/${{ matrix.target }}/release/$exe" README.md "dist/$name/"
+          cp "target/${{ matrix.target }}/release/loudnorm.exe" README.md "dist/$name/"
           cd dist
-          if [[ "$RUNNER_OS" == "Windows" ]]; then
-            pwsh -NoProfile -Command "Compress-Archive -Path '$name' -DestinationPath '$name.zip'"
-          else
-            tar czf "$name.tar.gz" "$name"
-          fi
+          pwsh -NoProfile -Command "Compress-Archive -Path '$name' -DestinationPath '$name.zip'"
           rm -rf "$name"
+          ls -l
+
+      # AppDir layout and the AppImage tools: see packaging/linux/make-appimage.sh.
+      - name: Package (Linux AppImage)
+        if: runner.os == 'Linux'
+        env:
+          APPIMAGE_ARCH: ${{ matrix.appimage_arch }}
+          APPIMAGETOOL_SHA256: ${{ matrix.appimagetool_sha256 }}
+          RUNTIME_SHA256: ${{ matrix.runtime_sha256 }}
+        run: |
+          name="${{ steps.pkg.outputs.name }}"
+          mkdir -p dist "$RUNNER_TEMP/appimage"
+          tools="$RUNNER_TEMP/appimage"
+          curl --fail --silent --show-error --location --output "$tools/appimagetool" \
+            "https://github.com/AppImage/appimagetool/releases/download/$APPIMAGETOOL_VERSION/appimagetool-$APPIMAGE_ARCH.AppImage"
+          curl --fail --silent --show-error --location --output "$tools/runtime" \
+            "https://github.com/AppImage/type2-runtime/releases/download/$TYPE2_RUNTIME_VERSION/runtime-$APPIMAGE_ARCH"
+          echo "$APPIMAGETOOL_SHA256  $tools/appimagetool" | sha256sum --check
+          echo "$RUNTIME_SHA256  $tools/runtime" | sha256sum --check
+          chmod +x "$tools/appimagetool"
+          bash packaging/linux/make-appimage.sh "target/${{ matrix.target }}/release/loudnorm" assets/icon-256.png \
+            packaging/linux/loudnorm.desktop "$tools/appimagetool" "$tools/runtime" "dist/$name.AppImage"
+
+          # The runtime is static, so the AppImage needs no more glibc than the binary inside; check that it stays so.
+          if readelf --dynamic "$tools/runtime" | grep --quiet NEEDED; then
+            echo "::error::the AppImage runtime is not static any more"
+            exit 1
+          fi
+          # Unpack it (no FUSE on the runner) and check the entries the AppDir specification requires.
+          cd "$RUNNER_TEMP"
+          rm -rf squashfs-root
+          "$GITHUB_WORKSPACE/dist/$name.AppImage" --appimage-extract
+          test -x squashfs-root/AppRun
+          test -f squashfs-root/loudnorm.desktop
+          test -f squashfs-root/loudnorm.png
+          test -L squashfs-root/.DirIcon
+          cmp squashfs-root/.DirIcon "$GITHUB_WORKSPACE/assets/icon-256.png"
+          cmp squashfs-root/usr/bin/loudnorm "$GITHUB_WORKSPACE/target/${{ matrix.target }}/release/loudnorm"
+          ls -l "$GITHUB_WORKSPACE/dist"
+
+      - name: Package (macOS app bundle)
+        if: runner.os == 'macOS'
+        run: |
+          name="${{ steps.pkg.outputs.name }}"
+          app="dist/$name/loudnorm.app"
+          mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+          cp "target/${{ matrix.target }}/release/loudnorm" "$app/Contents/MacOS/loudnorm"
+          chmod +x "$app/Contents/MacOS/loudnorm"
+          cp assets/icon.icns "$app/Contents/Resources/loudnorm.icns"
+          cp README.md "dist/$name/"
+          # The OS version the binary was linked to run on (LC_BUILD_VERSION minos; LC_VERSION_MIN_MACOSX on old toolchains).
+          min_macos=$(otool -l "$app/Contents/MacOS/loudnorm" | awk '$1 == "minos" { print $2; exit } $1 == "cmd" && $2 == "LC_VERSION_MIN_MACOSX" { old = 1 } old && $1 == "version" { print $2; exit }')
+          if [[ -z "$min_macos" ]]; then
+            echo "::error::cannot read the minimum macOS version from the binary"
+            exit 1
+          fi
+          echo "minimum macOS: $min_macos"
+          sed -e "s/@VERSION@/${{ steps.pkg.outputs.bundle_version }}/" -e "s/@MIN_MACOS@/$min_macos/" \
+            packaging/macos/Info.plist > "$app/Contents/Info.plist"
+          plutil -lint "$app/Contents/Info.plist"
+          # Sign the whole bundle ad hoc (there is no Developer ID certificate), so that Info.plist and the icon are sealed too.
+          codesign --force --sign - "$app"
+          codesign --verify --strict "$app"
+          cd dist
+          # ditto keeps the executable bit and the bundle layout (a plain zip may not); no resource forks or extended attributes.
+          ditto -c -k --norsrc --noextattr --keepParent "$name" "$name.zip"
+          rm -rf "$name"
+          # Unpack what was zipped and check the bundle survived.
+          check="$RUNNER_TEMP/bundle-check"
+          rm -rf "$check"
+          ditto -x -k "$name.zip" "$check"
+          test -x "$check/$name/loudnorm.app/Contents/MacOS/loudnorm"
+          test -f "$check/$name/loudnorm.app/Contents/Resources/loudnorm.icns"
+          plutil -lint "$check/$name/loudnorm.app/Contents/Info.plist"
+          codesign --verify --strict "$check/$name/loudnorm.app"
           ls -l
 
       - uses: actions/upload-artifact@v7

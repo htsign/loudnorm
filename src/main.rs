@@ -140,6 +140,7 @@ mod tests {
     use super::*;
 
     const ICON_ICO: &[u8] = include_bytes!("../assets/icon.ico");
+    const ICON_ICNS: &[u8] = include_bytes!("../assets/icon.icns");
 
     /// Splits an .ico into (size in px, image data) per directory entry; a width byte of 0 means 256.
     fn ico_entries(ico: &[u8]) -> Vec<(u32, &[u8])> {
@@ -153,6 +154,22 @@ mod tests {
                 (size, &ico[off..off + len])
             })
             .collect()
+    }
+
+    /// Splits an .icns into (OSType, image data) per entry. Numbers are big-endian and lengths include the 8-byte header.
+    fn icns_entries(icns: &[u8]) -> Vec<(String, &[u8])> {
+        assert_eq!(&icns[..4], b"icns");
+        let total = u32::from_be_bytes([icns[4], icns[5], icns[6], icns[7]]) as usize;
+        assert_eq!(total, icns.len(), "the header length must cover the whole file");
+        let mut entries = Vec::new();
+        let mut at = 8;
+        while at < icns.len() {
+            let len = u32::from_be_bytes([icns[at + 4], icns[at + 5], icns[at + 6], icns[at + 7]]) as usize;
+            entries.push((String::from_utf8(icns[at..at + 4].to_vec()).unwrap(), &icns[at + 8..at + len]));
+            at += len;
+        }
+        assert_eq!(at, icns.len(), "the last entry must end exactly at the end of the file");
+        entries
     }
 
     #[test]
@@ -185,6 +202,33 @@ mod tests {
         let entries = ico_entries(ICON_ICO);
 
         let (_, png) = entries.iter().find(|(size, _)| *size == 256).expect("256 px entry");
+        assert_eq!(*png, ICON_PNG);
+    }
+
+    #[test]
+    fn app_bundle_icon_has_png_entries_of_the_size_their_type_names() {
+        let mut got: Vec<(String, u32)> = icns_entries(ICON_ICNS)
+            .iter()
+            .map(|(kind, data)| {
+                assert_eq!(&data[..8], b"\x89PNG\r\n\x1a\n", "{kind} must be a PNG");
+                let width = u32::from_be_bytes([data[16], data[17], data[18], data[19]]);
+                let height = u32::from_be_bytes([data[20], data[21], data[22], data[23]]);
+                assert_eq!(width, height, "{kind} must be square");
+                (kind.clone(), width)
+            })
+            .collect();
+        got.sort();
+
+        // ic07-ic10 are 128-512 pt at 1x (ic10 is 512 pt at 2x); ic11-ic14 are 16-256 pt at 2x.
+        let want = [("ic07", 128), ("ic08", 256), ("ic09", 512), ("ic10", 1024), ("ic11", 32), ("ic12", 64), ("ic13", 256), ("ic14", 512)];
+        assert_eq!(got, want.map(|(kind, px)| (kind.to_string(), px)));
+    }
+
+    #[test]
+    fn app_bundle_icon_256px_entry_is_the_window_icon() {
+        let entries = icns_entries(ICON_ICNS);
+
+        let (_, png) = entries.iter().find(|(kind, _)| kind == "ic08").expect("ic08 entry");
         assert_eq!(*png, ICON_PNG);
     }
 }

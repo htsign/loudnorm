@@ -18,6 +18,41 @@
 
 対応形式: MP3 / FLAC / M4A（AAC・ALAC）/ Ogg Vorbis / Opus / WAV
 
+## インストールと起動
+
+GitHub Releases の配布ファイルから、お使いの OS と CPU に合うものをダウンロードします（ファイル名は下の「バージョンとリリース」の表）。インストーラーはありません。
+
+### Windows
+
+zip を展開し、`loudnorm.exe` を実行します。フォルダごと好きな場所に置けます。
+
+### macOS
+
+zip を展開すると `loudnorm.app` が入っています。「アプリケーション」などへ置いて開きます。Intel Mac は `x86_64-apple-darwin`、Apple シリコンは `aarch64-apple-darwin` です。
+
+Developer ID での署名と公証はしていない（ad-hoc 署名のみ）ため、初回は macOS が開くのをブロックします。次のどちらかで開けます。
+
+- 一度開こうとしたあと、「システム設定」→「プライバシーとセキュリティ」を下へスクロールし、「このまま開く」を押して確認する
+- ターミナルで隔離属性を外す: `xattr -dr com.apple.quarantine loudnorm.app`
+
+### Linux
+
+AppImage 1 ファイルです。実行権限を付けて起動します。
+
+```
+chmod +x loudnorm-v<version>-x86_64-unknown-linux-gnu.AppImage
+./loudnorm-v<version>-x86_64-unknown-linux-gnu.AppImage
+```
+
+- glibc 2.17 以降が必要です。
+- AppImage は FUSE（`fusermount`（または `fusermount3`）とカーネルの fuse モジュール）で自分自身をマウントして動きます。多くのディストリビューションに入っています。
+  - この AppImage のランタイムは静的リンクなので、`libfuse2` は要りません。
+- FUSE が使えない環境では、展開して動かせます。
+  - `./loudnorm-….AppImage --appimage-extract-and-run`（環境変数 `APPIMAGE_EXTRACT_AND_RUN=1` でも可）
+  - または `./loudnorm-….AppImage --appimage-extract` で `squashfs-root/` に展開し、`squashfs-root/AppRun` を実行
+- X11 / Wayland / OpenGL などのライブラリは同梱せず、システムのものを使います。
+- ランチャーやファイルマネージャーのアイコン、Wayland でのウィンドウアイコンは `.desktop` から決まります。AppImage は `.desktop` を持っていますが、メニューへ登録するには AppImageLauncher や appimaged などのデスクトップ統合ツールを使ってください。
+
 ## ビルド（Windows）
 
 ```
@@ -35,7 +70,7 @@ cargo build --release
 
 ## 使い方
 
-1. 「選択…」（または「ファイル」→「フォルダを開く…」）でフォルダを選ぶ（exe にフォルダをドロップして起動しても可）。自動で解析します。
+1. 「選択…」（または「ファイル」→「フォルダを開く…」）でフォルダを選ぶ（Windows と Linux では、実行ファイルにフォルダをドロップして起動しても可）。自動で解析します。
 2. 中央値・分布・各曲の補正量を確認する。**この時点ではファイルは変更されません。**
 3. 方法・許容幅・出力先を決めて「N 曲に適用…」→「実行」。
 4. 結果を確かめるときは再解析してください（適用後は二重適用を防ぐため、再解析するまで適用できません）。
@@ -49,7 +84,9 @@ cargo build --release
 
 画面の設定（ffmpeg の場所、方法、許容幅、ピーク上限、再エンコード設定、並列数、真のピーク、出力、更新日時の保持、起動時の更新確認、最後に解析したフォルダ、ウィンドウの大きさと最大化、グラフの表示、一覧の列幅）は、変更するたびに INI ファイルへ保存され、次回起動時に読み込まれます。
 
-- 既定の場所: `%APPDATA%\loudnorm\settings.ini`
+- 既定の場所:
+  - Windows: `%APPDATA%\loudnorm\settings.ini`
+  - Linux / macOS: `$XDG_CONFIG_HOME/loudnorm/settings.ini`（`XDG_CONFIG_HOME` が未設定なら `~/.config/loudnorm/settings.ini`）
 - exe と同じフォルダに `settings.ini` を置くと、そちらを使います（持ち運び用）。
 - 手で編集しても構いません。読めない値は既定値に戻し、ログに表示します。
 
@@ -108,13 +145,13 @@ loudnorm --cli <フォルダ> [--method reencode|lossless|tags] [--tol 1.0] [--m
 |---|---|
 | `loudnorm-v<version>-x86_64-pc-windows-msvc.zip` | Windows x64 |
 | `loudnorm-v<version>-aarch64-pc-windows-msvc.zip` | Windows ARM64 |
-| `loudnorm-v<version>-x86_64-unknown-linux-gnu.tar.gz` | Linux x64（glibc 2.17 以降） |
-| `loudnorm-v<version>-aarch64-unknown-linux-gnu.tar.gz` | Linux ARM64（glibc 2.17 以降） |
-| `loudnorm-v<version>-x86_64-apple-darwin.tar.gz` | macOS Intel |
-| `loudnorm-v<version>-aarch64-apple-darwin.tar.gz` | macOS Apple シリコン |
+| `loudnorm-v<version>-x86_64-unknown-linux-gnu.AppImage` | Linux x64（glibc 2.17 以降） |
+| `loudnorm-v<version>-aarch64-unknown-linux-gnu.AppImage` | Linux ARM64（glibc 2.17 以降） |
+| `loudnorm-v<version>-x86_64-apple-darwin.zip` | macOS Intel（`loudnorm.app` と README） |
+| `loudnorm-v<version>-aarch64-apple-darwin.zip` | macOS Apple シリコン（同上） |
 | `loudnorm-v<version>-src.tar.gz` / `-src.zip` | ソース |
 | `SHA256SUMS.txt` | 上記のチェックサム |
 
-macOS 版は署名していないため、初回はダウンロードしたファイルの隔離属性を外す（`xattr -d com.apple.quarantine loudnorm`）か、Finder の右クリックから開いてください。
+Linux の AppImage は `packaging/linux/make-appimage.sh`、macOS の `loudnorm.app` は `packaging/macos/Info.plist` と `assets/icon.icns` から、GitHub Actions が作ります。
 
 `main` 以外のブランチへの push でも同じビルドとテストが走ります（リリースはしません）。プルリクエストでは、バージョンが上がっていなければ警告します。
