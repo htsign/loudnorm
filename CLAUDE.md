@@ -69,7 +69,10 @@
 - 設定欄が長くなっても適用ボタンは常に見える位置に置く。
 - 画面の設定値（ffmpeg の場所、方法、許容幅、目標、ピーク上限、再エンコード設定、並列数、出力、更新日時の保持、ウィンドウサイズ、列幅、グラフの表示など）は `settings.ini` に保存し、次回起動時に読み込む。新しい設定を足すときも同様にする。
   - 場所は Windows が `%APPDATA%\loudnorm\settings.ini`、Linux / macOS が `$XDG_CONFIG_HOME/loudnorm/settings.ini`（未設定なら `~/.config/loudnorm/settings.ini`）。exe と同じフォルダに `settings.ini` があればそちらを優先する。
+    - AppImage では隣の `settings.ini` は読まない（他のアプリと同じフォルダに置かれやすく、別のアプリの設定を上書きしうるため）。
+      - 持ち運び用は AppImage 標準の `--appimage-portable-config`（`XDG_CONFIG_HOME` を `<AppImage>.config` に向ける）に任せる。
 - ffmpeg の場所は「設定」→「環境設定…」のダイアログで、フォルダ選択とファイル選択の両方で指定できるようにする。
+  - ffmpeg の探索では、`APPDIR` の下で動いているときだけ、`APPIMAGE` の親フォルダを exe のフォルダとして扱う（`ffmpeg::exe_dir`）。
 
 ### 処理
 - 解析と適用は曲単位で並列に実行する。並列数の既定は論理コア数 − 1（最低 1）。

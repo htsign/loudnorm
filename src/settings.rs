@@ -3,6 +3,9 @@
 //! Location: `settings.ini` next to the exe if that file exists (portable use), otherwise
 //! `%APPDATA%\loudnorm\settings.ini` on Windows and `$XDG_CONFIG_HOME/loudnorm/settings.ini`
 //! (or `~/.config/...`) elsewhere. Lines starting with `;` or `#` are comments.
+//! Inside an AppImage the exe sits in a mount point or a temporary extraction, so no `settings.ini`
+//! is found next to it (use the AppImage's `--appimage-portable-config`, which points
+//! `XDG_CONFIG_HOME` elsewhere).
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;

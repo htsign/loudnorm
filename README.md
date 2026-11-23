@@ -50,6 +50,7 @@ chmod +x loudnorm-v<version>-x86_64-unknown-linux-gnu.AppImage
 - FUSE が使えない環境では、展開して動かせます。
   - `./loudnorm-….AppImage --appimage-extract-and-run`（環境変数 `APPIMAGE_EXTRACT_AND_RUN=1` でも可）
   - または `./loudnorm-….AppImage --appimage-extract` で `squashfs-root/` に展開し、`squashfs-root/AppRun` を実行
+    - この場合、ffmpeg は `squashfs-root/usr/bin/` を「exe と同じフォルダ」として探します。
 - X11 / Wayland / OpenGL などのライブラリは同梱せず、システムのものを使います。
 - ランチャーやファイルマネージャーのアイコン、Wayland でのウィンドウアイコンは `.desktop` から決まります。AppImage は `.desktop` を持っていますが、メニューへ登録するには AppImageLauncher や appimaged などのデスクトップ統合ツールを使ってください。
 
@@ -64,7 +65,7 @@ cargo build --release
 ## 実行に必要なもの
 
 - **ffmpeg と ffprobe**（再エンコードと、Opus など一部形式の解析に使用）
-  - PATH 上、exe と同じフォルダ、または「設定」→「環境設定…」で指定した場所から探します（「exe と同じフォルダ」の扱いは「設定ファイル」の節と同じで、AppImage では使えません）。
+  - PATH 上、exe と同じフォルダ（AppImage では AppImage のあるフォルダ）、または「設定」→「環境設定…」で指定した場所から探します。
   - MP3 の再エンコードには libmp3lame、Vorbis には libvorbis を含むビルドが必要です（起動時に検出し、ない場合はその形式だけ失敗します）。
 - 解析は MP3・FLAC・AAC-LC・ALAC・Vorbis・WAV なら ffmpeg なしでも動きます（Opus と HE-AAC は ffmpeg が必要）。ffmpeg なしで適用できるのは「無劣化を優先」の MP3 と「ReplayGain タグだけ」です。
 
@@ -87,8 +88,9 @@ cargo build --release
 - 既定の場所:
   - Windows: `%APPDATA%\loudnorm\settings.ini`
   - Linux / macOS: `$XDG_CONFIG_HOME/loudnorm/settings.ini`（`XDG_CONFIG_HOME` が未設定なら `~/.config/loudnorm/settings.ini`）
-- exe と同じフォルダに `settings.ini` を置くと、そちらを使います（持ち運び用）。
-  - これは Windows の zip 版だけです。AppImage では隣に置いた `settings.ini` を読まず、既定の場所を使います。macOS では `loudnorm.app/Contents/MacOS/` が「exe と同じフォルダ」に当たります。
+- 持ち運び用（ポータブル化）:
+  - Windows の場合は、`loudnorm.exe` と同じフォルダに `settings.ini` を置くとポータブル化できます。
+  - Linux の場合は、AppImage を一度 `--appimage-portable-config` を付けて実行するとポータブル化できます。
 - 手で編集しても構いません。読めない値は既定値に戻し、ログに表示します。
 
 ## 更新の確認
