@@ -30,7 +30,7 @@
   - CI はプルリクエストのマージ結果の版を `main` の版と比べ、同じなら警告、下がっていればエラーにする。`develop` → `main` で同じならエラーにする。
 - `main` に push され、その版のリリースがまだなければ `release.yml` が全プラットフォームをビルドして `v<version>` を Releases に登録する。`develop` → `main` のプルリクエストでは、マージ時に出るリリースノートの下書きを CI のジョブサマリーに出す。
 - 配布対象は最低限 Windows x64 と Linux x64。加えて Windows ARM64、Linux ARM64、macOS（Intel / Apple シリコン）も出す。Linux は cargo-zigbuild で glibc 2.17 を下限にリンクし、ランナーの Ubuntu の版に依存させない（CI で必要な glibc の版を検査する）。
-- `main` 以外への push でも `ci.yml` が同じビルドとテストを全プラットフォームで実行する。
+- `main` 以外への push でも `ci.yml` が同じビルドとテストを全プラットフォームで実行する。ただし `src/`、`Cargo.toml`、`Cargo.lock`、`.github/workflows/build.yml` のどれも変わらない push（CI やドキュメントだけの変更）では実行しない。
 - プルリクエストは、変更内容を表す適切なタイトルだけを付け、本文は空のまま作成する。
 
 ## 実装方針

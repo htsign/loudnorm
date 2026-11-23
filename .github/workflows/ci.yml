@@ -1,4 +1,5 @@
-# Branch pushes: build and test every platform (same jobs as a release, without publishing).
+# Branch pushes: build and test every platform (same jobs as a release, without publishing), only when
+# the push changes the code, its dependencies or the build itself; CI- or docs-only pushes skip it.
 # Pull requests: compare the version in Cargo.toml with the latest release (main).
 # develop -> main pull requests: also preview the release notes the merge will publish.
 name: CI
@@ -6,6 +7,11 @@ name: CI
 on:
   push:
     branches-ignore: [main]
+    paths:
+      - src/**
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/build.yml
   pull_request:
 
 permissions:
