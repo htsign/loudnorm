@@ -33,7 +33,7 @@ zip を展開すると `loudnorm.app` が入っています。「アプリケー
 Developer ID での署名と公証はしていない（ad-hoc 署名のみ）ため、初回は macOS が開くのをブロックします。次のどちらかで開けます。
 
 - 一度開こうとしたあと、「システム設定」→「プライバシーとセキュリティ」を下へスクロールし、「このまま開く」を押して確認する
-- ターミナルで隔離属性を外す: `xattr -dr com.apple.quarantine loudnorm.app`
+- ターミナルで隔離属性を外す: `xattr -dr com.apple.quarantine /Applications/loudnorm.app`（パスはアプリを置いた場所に合わせる）
 
 ### Linux
 
