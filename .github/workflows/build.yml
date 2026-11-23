@@ -86,9 +86,9 @@ jobs:
       - name: Check required glibc
         if: matrix.glibc
         run: |
-          need=$(objdump -T "target/${{ matrix.target }}/release/loudnorm" | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -n1)
+          need=$(objdump --dynamic-syms "target/${{ matrix.target }}/release/loudnorm" | grep --only-matching 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort --unique --version-sort | tail --lines=1)
           echo "highest glibc symbol version: $need (limit ${{ matrix.glibc }})"
-          if [[ "$(printf '%s\n%s\n' "$need" "${{ matrix.glibc }}" | sort -V | tail -n1)" != "${{ matrix.glibc }}" ]]; then
+          if [[ "$(printf '%s\n%s\n' "$need" "${{ matrix.glibc }}" | sort --version-sort | tail --lines=1)" != "${{ matrix.glibc }}" ]]; then
             echo "::error::binary needs glibc $need, newer than ${{ matrix.glibc }}"
             exit 1
           fi
@@ -97,7 +97,7 @@ jobs:
         id: pkg
         shell: bash
         run: |
-          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head --lines=1)
           echo "name=loudnorm-v${version}-${{ matrix.target }}" >> "$GITHUB_OUTPUT"
           # CFBundleVersion and CFBundleShortVersionString take up to three dot-separated integers: drop any -pre / +build part.
           echo "bundle_version=${version%%[-+]*}" >> "$GITHUB_OUTPUT"
@@ -107,12 +107,12 @@ jobs:
         shell: bash
         run: |
           name="${{ steps.pkg.outputs.name }}"
-          mkdir -p "dist/$name"
+          mkdir --parents "dist/$name"
           cp "target/${{ matrix.target }}/release/loudnorm.exe" README.md "dist/$name/"
           cd dist
           pwsh -NoProfile -Command "Compress-Archive -Path '$name' -DestinationPath '$name.zip'"
-          rm -rf "$name"
-          ls -l
+          rm --recursive --force "$name"
+          ls --format=long
 
       # AppDir layout and the AppImage tools: see packaging/linux/make-appimage.sh.
       - name: Package (Linux AppImage)
@@ -123,7 +123,7 @@ jobs:
           RUNTIME_SHA256: ${{ matrix.runtime_sha256 }}
         run: |
           name="${{ steps.pkg.outputs.name }}"
-          mkdir -p dist "$RUNNER_TEMP/appimage"
+          mkdir --parents dist "$RUNNER_TEMP/appimage"
           tools="$RUNNER_TEMP/appimage"
           curl --fail --silent --show-error --location --output "$tools/appimagetool" \
             "https://github.com/AppImage/appimagetool/releases/download/$APPIMAGETOOL_VERSION/appimagetool-$APPIMAGE_ARCH.AppImage"
@@ -142,7 +142,7 @@ jobs:
           fi
           # Unpack it (no FUSE on the runner) and check the entries the AppDir specification requires.
           cd "$RUNNER_TEMP"
-          rm -rf squashfs-root
+          rm --recursive --force squashfs-root
           "$GITHUB_WORKSPACE/dist/$name.AppImage" --appimage-extract
           test -x squashfs-root/AppRun
           test -f squashfs-root/loudnorm.desktop
@@ -150,7 +150,7 @@ jobs:
           test -L squashfs-root/.DirIcon
           cmp squashfs-root/.DirIcon "$GITHUB_WORKSPACE/assets/icon-256.png"
           cmp squashfs-root/usr/bin/loudnorm "$GITHUB_WORKSPACE/target/${{ matrix.target }}/release/loudnorm"
-          ls -l "$GITHUB_WORKSPACE/dist"
+          ls --format=long "$GITHUB_WORKSPACE/dist"
 
       - name: Package (macOS app bundle)
         if: runner.os == 'macOS'

@@ -10,7 +10,7 @@
 #
 # The AppImage runtime is passed in (not downloaded by appimagetool) so that CI can pin and verify it.
 # FUSE is not needed for the build: appimagetool, itself an AppImage, runs through --appimage-extract-and-run.
-set -euo pipefail
+set -o errexit -o nounset -o pipefail
 
 if [[ $# -ne 6 ]]; then
   echo "usage: APPIMAGE_ARCH=<x86_64|aarch64> $0 <loudnorm binary> <icon PNG> <desktop file> <appimagetool> <runtime file> <output .AppImage>" >&2

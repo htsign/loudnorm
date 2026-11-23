@@ -24,7 +24,7 @@ jobs:
           fetch-depth: 0
       - name: Compare version with the base branch
         run: |
-          get() { sed -n 's/^version = "\(.*\)"/\1/p' | head -n1; }
+          get() { sed --quiet 's/^version = "\(.*\)"/\1/p' | head --lines=1; }
           head_v=$(get < Cargo.toml)
           base_v=$(git show "origin/${{ github.base_ref }}:Cargo.toml" | get)
           echo "base $base_v -> head $head_v"
