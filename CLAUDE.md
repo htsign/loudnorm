@@ -14,6 +14,8 @@
 | `src/ffmpeg.rs` | ffmpeg / ffprobe の検出と実行 |
 | `src/settings.rs` | 設定ファイル（INI）の読み書き |
 | `src/update.rs` | 更新の確認（GitHub Releases の最新版の取得と版の比較） |
+| `build.rs` | Windows で exe にアイコン（`assets/icon.ico`）を埋め込む |
+| `assets/` | アイコン（SVG 原画、.ico / .png、それらを作る `make_icons.js`） |
 
 ## バージョンとリリース
 
@@ -43,6 +45,15 @@
   - ほかの形式は lofty の具体型（FlacFile、Mp4File、VorbisFile、WavFile）で読み書きし、汎用 Tag 経由の変換で情報を落とさない。
 
 ### UI
+- exe（`build.rs` が `assets/icon.ico` を Windows リソースとして埋め込む）とウィンドウ（`assets/icon-256.png`）には、同じ `assets/` のアイコンを使う。
+  - 原画は `icon.svg`（棒 4 本）と `icon-small.svg`（棒 3 本。16 px でも棒を見分けられるよう減らした）。
+  - SVG を直したら `NODE_PATH=<dir>/node_modules node assets/make_icons.js` で `icon.ico` と `icon-256.png` を作り直す（Node.js と playwright + Chromium が要る。リポジトリ外の `<dir>` に入れる。入れ方はスクリプト冒頭）。
+    - 16・20・24・32 px は `icon-small.svg`、40・48・64・256 px と `icon-256.png` は `icon.svg` から作る（20・40・64 px は Windows の拡大表示用）。
+    - `.ico` の各エントリは PNG で、256 px のエントリは `icon-256.png` と同一にする。
+  - Windows のタイトルバー・タスクバー・Alt+Tab には eframe が `icon-256.png`（棒 4 本）を縮小して使い、エクスプローラーの 16 px には `.ico` の小サイズ（棒 3 本）が使われる。
+    - この差は許容する。
+  - Wayland ではウィンドウのアイコンを `with_icon` でなく、app_id（`loudnorm`）に一致する `.desktop` ファイルから決める。
+    - 配布物に同梱する `loudnorm.desktop` には `StartupWMClass=loudnorm` を書く。
 - 日本語 UI フォントを 1 つだけ選んで最優先にする（Yu Gothic UI → Meiryo UI → MS UI Gothic の順）。英字用の既定フォントと混在させるとベースラインがずれる。
 - 一覧はフォルダとファイル名を別の列にし、長い名前は中間を省略する（`abc…xyz`）。ツールチップにはその列の省略前の値を出す。
 - 設定欄が長くなっても適用ボタンは常に見える位置に置く。
@@ -61,6 +72,6 @@
 
 ## 確認
 
-- `cargo test` で統計・設定まわりのユニットテストを実行する。
+- `cargo test` で統計・設定まわりのユニットテストと、アイコン資産（`.ico` の各サイズ、256 px のエントリと `icon-256.png` の一致）の検査を実行する。
 - 補正の結果は `--cli <フォルダ> [--apply]` で確かめられる（ラウドネス、タグ、サンプル数の比較）。
-- Windows 固有のコード（フォント、ダイアログ、コンソール）は Linux では確認できないため、その旨を明記する。
+- Windows 固有のコード（フォント、ダイアログ、コンソール、exe へのアイコン埋め込み、タイトルバー・タスクバーのアイコン）は Linux では確認できないため、その旨を明記する。
