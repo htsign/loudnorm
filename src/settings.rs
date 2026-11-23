@@ -30,6 +30,8 @@ pub struct Settings {
     pub in_place: bool,
     pub output_folder: String,
     pub keep_mtime: bool,
+    /// Check GitHub for a newer release at startup.
+    pub check_updates: bool,
     pub window_width: f32,
     pub window_height: f32,
     pub window_maximized: bool,
@@ -66,6 +68,7 @@ impl Default for Settings {
             in_place: true,
             output_folder: String::new(),
             keep_mtime: true,
+            check_updates: true,
             window_width: 1280.0,
             window_height: 820.0,
             window_maximized: false,
@@ -142,6 +145,10 @@ impl Settings {
              output_folder = {}\n\
              keep_mtime = {}\n\
              \n\
+             [update]\n\
+             ; 起動時に GitHub で新しいバージョンがないか確認する\n\
+             check_on_startup = {}\n\
+             \n\
              [window]\n\
              ; 最大化していないときの大きさ（論理ピクセル）\n\
              width = {}\n\
@@ -170,6 +177,7 @@ impl Settings {
             self.in_place,
             self.output_folder,
             self.keep_mtime,
+            self.check_updates,
             self.window_width,
             self.window_height,
             self.window_maximized,
@@ -243,6 +251,7 @@ impl Settings {
         take!("output.in_place", s.in_place, b);
         take!("output.output_folder", s.output_folder, |v: &str| Some(v.to_string()));
         take!("output.keep_mtime", s.keep_mtime, b);
+        take!("update.check_on_startup", s.check_updates, b);
         let size = |v: &str| v.parse::<f32>().ok().filter(|x| (400.0..=20000.0).contains(x));
         take!("window.width", s.window_width, size);
         take!("window.height", s.window_height, size);
@@ -312,6 +321,7 @@ mod tests {
             in_place: false,
             output_folder: "E:\\out".into(),
             keep_mtime: false,
+            check_updates: false,
             window_width: 1500.0,
             window_height: 900.0,
             window_maximized: true,
@@ -331,10 +341,12 @@ mod tests {
         assert_eq!(bad, vec!["plan.tolerance_db".to_string(), "process.jobs".to_string()]);
     }
 
-    fn window_section(ini: &str) -> Vec<&str> {
+    /// The trimmed lines of `[name]` in an INI text, up to the next section header.
+    fn section_lines<'a>(ini: &'a str, name: &str) -> Vec<&'a str> {
+        let header = format!("[{name}]");
         ini.lines()
             .map(str::trim)
-            .skip_while(|l| *l != "[window]")
+            .skip_while(|l| *l != header)
             .skip(1)
             .take_while(|l| !l.starts_with('['))
             .collect()
@@ -347,8 +359,8 @@ mod tests {
         let ini = s.to_ini();
         let (r, bad) = Settings::from_ini(&ini);
 
-        assert!(window_section(&ini).contains(&"graph = density"), "{ini}");
-        assert!(!window_section(&ini).iter().any(|l| l.starts_with("histogram")), "{ini}");
+        assert!(section_lines(&ini, "window").contains(&"graph = density"), "{ini}");
+        assert!(!section_lines(&ini, "window").iter().any(|l| l.starts_with("histogram")), "{ini}");
         assert!(bad.is_empty(), "{bad:?}");
         assert!(r.density);
     }
@@ -360,8 +372,8 @@ mod tests {
         let ini = s.to_ini();
         let (r, bad) = Settings::from_ini(&ini);
 
-        assert!(window_section(&ini).contains(&"graph = dots"), "{ini}");
-        assert!(!window_section(&ini).iter().any(|l| l.starts_with("histogram")), "{ini}");
+        assert!(section_lines(&ini, "window").contains(&"graph = dots"), "{ini}");
+        assert!(!section_lines(&ini, "window").iter().any(|l| l.starts_with("histogram")), "{ini}");
         assert!(bad.is_empty(), "{bad:?}");
         assert!(!r.density);
     }
@@ -388,5 +400,35 @@ mod tests {
 
         assert!(bad.is_empty(), "{bad:?}");
         assert_eq!(r, Settings::default());
+    }
+
+    #[test]
+    fn check_updates_defaults_to_on() {
+        assert!(Settings::default().check_updates);
+    }
+
+    #[test]
+    fn check_on_startup_is_written_in_the_update_section() {
+        let ini = Settings::default().to_ini();
+
+        let lines = section_lines(&ini, "update");
+
+        assert!(lines.contains(&"check_on_startup = true"), "[update] lines: {lines:?}\n{ini}");
+    }
+
+    #[test]
+    fn invalid_check_on_startup_is_reported_and_default_kept() {
+        let (r, bad) = Settings::from_ini("[update]\ncheck_on_startup = maybe\n");
+
+        assert_eq!(bad, vec!["update.check_on_startup".to_string()]);
+        assert!(r.check_updates);
+    }
+
+    #[test]
+    fn check_on_startup_false_is_read() {
+        let (r, bad) = Settings::from_ini("[update]\ncheck_on_startup = false\n");
+
+        assert!(!r.check_updates);
+        assert!(bad.is_empty(), "{bad:?}");
     }
 }
