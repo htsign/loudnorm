@@ -71,6 +71,7 @@ pub struct App {
     confirm: bool,
     stats: Option<Stats>,
     graph: GraphView,
+    density_cache: DensityCache,
     auto_start: bool,
     show_prefs: bool,
     show_about: bool,
@@ -165,7 +166,7 @@ fn elide_middle(ui: &egui::Ui, text: &str) -> String {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum GraphView {
     Dots,
-    Histogram,
+    Density,
 }
 
 fn short_label(t: Target) -> &'static str {
@@ -176,24 +177,84 @@ fn short_label(t: Target) -> &'static str {
     }
 }
 
-/// Loudness graph: one dot per track (with its planned move) or a histogram, the target line and the
+/// The kernel density curve kept between frames: the O(tracks x width) estimate is redone only when the loudness
+/// values or the plot range / width change, not on every repaint (hover, progress updates).
+#[derive(Default)]
+struct DensityCache {
+    /// Loudness values in track order; the key for `sorted` and `h`.
+    raw: Vec<f64>,
+    sorted: Vec<f64>,
+    /// Silverman bandwidth of `sorted`.
+    h: f64,
+    /// (lo, hi, steps) that `grid` was computed for.
+    grid_key: (f64, f64, usize),
+    /// Densities at the `steps + 1` evenly spaced points of [lo, hi] (see `grid_x`).
+    grid: Vec<f64>,
+}
+
+/// The i-th of `steps + 1` evenly spaced points of [lo, hi]; the last one is exactly `hi`.
+fn grid_x(lo: f64, hi: f64, steps: usize, i: usize) -> f64 {
+    if i == steps { hi } else { lo + (hi - lo) * i as f64 / steps as f64 }
+}
+
+impl DensityCache {
+    /// Takes the values to draw (non-empty) and returns their Silverman bandwidth.
+    fn set_values(&mut self, vals: impl Iterator<Item = f64> + Clone) -> f64 {
+        if !vals.clone().eq(self.raw.iter().copied()) {
+            self.raw = vals.collect();
+            self.sorted = self.raw.clone();
+            self.sorted.sort_by(f64::total_cmp);
+            self.h = core::silverman_bandwidth(&self.sorted);
+            self.grid.clear();
+        }
+        self.h
+    }
+
+    /// Densities at the `steps + 1` grid points of [lo, hi], estimated with a bandwidth no narrower than the grid spacing.
+    fn grid(&mut self, lo: f64, hi: f64, steps: usize) -> &[f64] {
+        if self.grid.is_empty() || self.grid_key != (lo, hi, steps) {
+            let bw = core::display_bandwidth(self.h, lo, hi, steps);
+            self.grid = (0..=steps).map(|i| core::kde_density(&self.sorted, bw, grid_x(lo, hi, steps, i))).collect();
+            self.grid_key = (lo, hi, steps);
+        }
+        &self.grid
+    }
+}
+
+/// Loudness graph: one dot per track (with its planned move) or a kernel density curve, the target line and the
 /// tolerance band, and a Q1–median–Q3 box. Returns the LUFS value the user clicked, if any.
-fn loudness_graph(ui: &mut egui::Ui, tracks: &[Track], st: Option<&Stats>, po: &PlanOptions, view: GraphView) -> Option<f64> {
+fn loudness_graph(
+    ui: &mut egui::Ui,
+    tracks: &[Track],
+    st: Option<&Stats>,
+    po: &PlanOptions,
+    view: GraphView,
+    cache: &mut DensityCache,
+) -> Option<f64> {
     let pts: Vec<(f64, f64, Action, bool)> = tracks
         .iter()
         .filter(|t| t.include)
         .filter_map(|t| t.loudness.map(|l| (l, t.gain, t.action, t.error.is_some())))
         .collect();
-    let h = if view == GraphView::Histogram { 140.0 } else { 84.0 };
+    let density = view == GraphView::Density;
+    let h = if density { 140.0 } else { 84.0 };
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), h), egui::Sense::click());
     let p = ui.painter_at(rect);
     p.rect_filled(rect, 6.0, ui.visuals().extreme_bg_color);
     let (Some(st), false) = (st, pts.is_empty()) else { return None };
     let weak = ui.visuals().weak_text_color();
     let tags = po.method == Method::Tags;
+    let h = if density { cache.set_values(pts.iter().map(|q| q.0)) } else { 0.0 };
     let lo = pts.iter().map(|x| x.0.min(x.0 + x.1)).fold(st.target, f64::min).min(st.min) - 1.0;
     let hi = pts.iter().map(|x| x.0.max(x.0 + x.1)).fold(st.target, f64::max).max(st.max) + 1.0;
     let (lo, hi) = if tags { (st.min - 1.0, st.max + 1.0) } else { (lo, hi) };
+    let (lo, hi) = if density {
+        // Leave room for the curve's tails beyond the extreme tracks.
+        let tail = (3.0 * h).max(1.0);
+        (lo.min(st.min - tail), hi.max(st.max + tail))
+    } else {
+        (lo, hi)
+    };
     let pad = 14.0;
     let w = rect.width() - 2.0 * pad;
     let x = |v: f64| rect.left() + pad + ((v - lo) / (hi - lo).max(1e-6)) as f32 * w;
@@ -203,7 +264,7 @@ fn loudness_graph(ui: &mut egui::Ui, tracks: &[Track], st: Option<&Stats>, po: &
     let box_y = axis_y - 8.0;
     let plot_bottom = box_y - 8.0;
 
-    if !tags {
+    if !tags && !density {
         let band = egui::Rect::from_x_y_ranges(x(st.target - po.tolerance)..=x(st.target + po.tolerance), top..=plot_bottom);
         p.rect_filled(band, 3.0, ACCENT.gamma_multiply(0.15));
     }
@@ -226,31 +287,44 @@ fn loudness_graph(ui: &mut egui::Ui, tracks: &[Track], st: Option<&Stats>, po: &
                 p.circle_filled(egui::pos2(x(*l), y), if n > 400 { 2.0 } else { 3.0 }, c);
             }
         }
-        GraphView::Histogram => {
-            // Bin width: 0.5 LU for narrow spreads, otherwise 1 LU.
-            let bw = if st.max - st.min <= 12.0 { 0.5 } else { 1.0 };
-            let first = (lo / bw).floor() * bw;
-            let nb = (((hi - first) / bw).ceil() as usize).max(1);
-            let mut bins = vec![(0usize, 0usize); nb]; // (kept, changed)
-            for (l, _, a, _) in &pts {
-                let i = (((l - first) / bw).floor() as usize).min(nb - 1);
-                if a.changes_file() { bins[i].1 += 1 } else { bins[i].0 += 1 }
-            }
-            let maxc = bins.iter().map(|b| b.0 + b.1).max().unwrap_or(1).max(1);
-            let unit = (plot_bottom - top - 12.0) / maxc as f32;
-            let font = egui::FontId::proportional(10.0);
-            for (i, (k, c)) in bins.iter().enumerate() {
-                if k + c == 0 {
-                    continue;
+        GraphView::Density => {
+            // About one point per 2 px.
+            let steps = ((w / 2.0).ceil() as usize).clamp(2, 2000);
+            let mut xs: Vec<f64> = (0..=steps).map(|i| grid_x(lo, hi, steps, i)).collect();
+            let mut ds: Vec<f64> = cache.grid(lo, hi, steps).to_vec();
+            let edges = [st.target - po.tolerance, st.target + po.tolerance];
+            if !tags {
+                // Add the tolerance band edges (density interpolated along the curve) so the fill splits exactly there.
+                for e in edges.into_iter().filter(|e| *e > lo && *e < hi) {
+                    let i = xs.partition_point(|v| *v < e);
+                    let d = ds[i - 1] + (e - xs[i - 1]) / (xs[i] - xs[i - 1]) * (ds[i] - ds[i - 1]);
+                    xs.insert(i, e);
+                    ds.insert(i, d);
                 }
-                let x0 = x(first + i as f64 * bw) + 0.5;
-                let x1 = x(first + (i + 1) as f64 * bw) - 0.5;
-                let yk = plot_bottom - *k as f32 * unit;
-                let yc = yk - *c as f32 * unit;
-                p.rect_filled(egui::Rect::from_x_y_ranges(x0..=x1, yk..=plot_bottom), 1.0, weak.gamma_multiply(0.8));
-                p.rect_filled(egui::Rect::from_x_y_ranges(x0..=x1, yc..=yk), 1.0, WARN);
-                if x1 - x0 > 9.0 {
-                    p.text(egui::pos2((x0 + x1) / 2.0, yc - 1.0), egui::Align2::CENTER_BOTTOM, format!("{}", k + c), font.clone(), weak);
+            }
+            let unit = (plot_bottom - top - 6.0) / ds.iter().copied().fold(1e-12, f64::max) as f32;
+            let (outside, inside) = if ui.visuals().dark_mode {
+                (Color32::from_rgba_unmultiplied(250, 135, 43, 230), Color32::from_rgba_unmultiplied(160, 160, 160, 230))
+            } else {
+                (Color32::from_rgba_unmultiplied(226, 122, 40, 230), Color32::from_rgba_unmultiplied(140, 140, 140, 230))
+            };
+            let curve = |i: usize| egui::pos2(x(xs[i]), plot_bottom - ds[i] as f32 * unit);
+            let mut mesh = egui::Mesh::default();
+            for i in 0..xs.len() - 1 {
+                let in_band = tags || ((xs[i] + xs[i + 1]) / 2.0 - st.target).abs() <= po.tolerance;
+                let c = if in_band { inside } else { outside };
+                let (a, b) = (curve(i), curve(i + 1));
+                let base = mesh.vertices.len() as u32;
+                for q in [a, b, egui::pos2(b.x, plot_bottom), egui::pos2(a.x, plot_bottom)] {
+                    mesh.colored_vertex(q, c);
+                }
+                mesh.add_triangle(base, base + 1, base + 2);
+                mesh.add_triangle(base, base + 2, base + 3);
+            }
+            p.add(egui::Shape::mesh(mesh));
+            if !tags {
+                for e in edges.into_iter().filter(|e| *e > lo && *e < hi) {
+                    p.line_segment([egui::pos2(x(e), top), egui::pos2(x(e), plot_bottom)], Stroke::new(1.0, ACCENT.gamma_multiply(0.7)));
                 }
             }
         }
@@ -299,7 +373,7 @@ impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, st: Settings, settings_msg: String) -> Self {
         let font = install_fonts(&cc.egui_ctx);
         let ff_hint = st.ffmpeg.clone();
-        let graph = if st.histogram { GraphView::Histogram } else { GraphView::Dots };
+        let graph = if st.density { GraphView::Density } else { GraphView::Dots };
         let ff = if ff_hint.trim().is_empty() {
             Ffmpeg::locate(None)
         } else {
@@ -360,6 +434,7 @@ impl App {
             confirm: false,
             stats: None,
             graph,
+            density_cache: DensityCache::default(),
             show_prefs: false,
             show_about: false,
             update: Arc::new(Mutex::new(UpdateState::NotChecked)),
@@ -406,7 +481,7 @@ impl App {
             lossless_fallback_reencode: self.po.lossless_fallback_reencode,
             target: self.po.target,
             custom_target: self.po.custom_target,
-            histogram: self.graph == GraphView::Histogram,
+            density: self.graph == GraphView::Density,
             mp3: self.mp3,
             aac_kbps: self.aac_kbps,
             vorbis_q: self.vorbis_q,
@@ -997,7 +1072,7 @@ impl eframe::App for App {
             });
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.graph, GraphView::Dots, "分布（各曲）");
-                ui.selectable_value(&mut self.graph, GraphView::Histogram, "ヒストグラム");
+                ui.selectable_value(&mut self.graph, GraphView::Density, "分布曲線");
                 if let Some(st) = &self.stats {
                     ui.label(RichText::new(format!(
                         "n={}　平均 {:.1}　中央値 {:.1}　Q1 {:.1}　Q3 {:.1}　σ {:.1}　範囲 {:.1}〜{:.1}　（クリックで目標を設定）",
@@ -1005,7 +1080,7 @@ impl eframe::App for App {
                     )).small().weak());
                 }
             });
-            let pick = loudness_graph(ui, &s.tracks, self.stats.as_ref(), &self.po, self.graph);
+            let pick = loudness_graph(ui, &s.tracks, self.stats.as_ref(), &self.po, self.graph, &mut self.density_cache);
             if let Some(v) = pick {
                 if self.po.method != Method::Tags {
                     self.po.target = Target::Custom;
