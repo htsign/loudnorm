@@ -1,0 +1,6 @@
+# Generated release notes (gh release create --generate-notes): leave out the develop -> main pull
+# request itself, so a release lists the pull requests merged into develop since the previous one.
+changelog:
+  exclude:
+    labels:
+      - release
