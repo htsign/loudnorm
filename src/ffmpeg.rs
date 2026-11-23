@@ -36,7 +36,7 @@ pub fn command(exe: &Path) -> Command {
     c
 }
 
-/// The folder searched for a portable `ffmpeg` / `ffprobe` next to the exe.
+/// The folder searched for a portable `ffmpeg` / `ffprobe` next to the exe (not on macOS; see `candidates`).
 /// Inside an AppImage the running exe lives in a mount point or a temporary extraction that goes away,
 /// so this is the folder holding the AppImage file instead.
 fn exe_dir() -> Option<PathBuf> {
@@ -79,19 +79,33 @@ fn exe_dir_from(appimage: Option<&OsStr>, appdir: Option<&OsStr>, current_exe: O
     exe.parent().map(Path::to_path_buf)
 }
 
+/// Where Homebrew puts its executables: Apple silicon first, then Intel.
+/// A GUI app started from Finder does not get these in its PATH.
+const HOMEBREW_BIN_DIRS: [&str; 2] = ["/opt/homebrew/bin", "/usr/local/bin"];
+
+/// The paths to try for `name`, in order. On macOS the exe sits inside the `.app` bundle, where nothing may be
+/// added without breaking its signature, so the exe's folder is left out and the Homebrew folders come after PATH.
+fn candidates(hint: Option<PathBuf>, exe_dir: Option<&Path>, name: &str, macos: bool) -> Vec<PathBuf> {
+    let mut cands: Vec<PathBuf> = hint.into_iter().collect();
+    if !macos && let Some(dir) = exe_dir {
+        cands.push(dir.join(name));
+    }
+    cands.push(PathBuf::from(name));
+    if macos {
+        cands.extend(HOMEBREW_BIN_DIRS.iter().map(|d| Path::new(d).join(name)));
+    }
+    cands
+}
+
 impl Ffmpeg {
-    /// `hint` is a user-given path to ffmpeg(.exe) or its folder; otherwise the exe's folder (see `exe_dir`) and PATH are tried.
+    /// `hint` is a user-given path to ffmpeg(.exe) or its folder.
+    /// After it come the exe's folder (see `exe_dir`; not on macOS), PATH, and on macOS the Homebrew folders.
     pub fn locate(hint: Option<&Path>) -> Result<Ffmpeg> {
         let exe = |n: &str| if cfg!(windows) { format!("{n}.exe") } else { n.to_string() };
-        let mut cands: Vec<PathBuf> = Vec::new();
-        if let Some(h) = hint.filter(|h| !h.as_os_str().is_empty()) {
-            if h.is_dir() { cands.push(h.join(exe("ffmpeg"))) } else { cands.push(h.to_path_buf()) }
-        }
-        if let Some(dir) = exe_dir() {
-            cands.push(dir.join(exe("ffmpeg")));
-        }
-        cands.push(PathBuf::from(exe("ffmpeg")));
-        for c in cands {
+        let hint = hint
+            .filter(|h| !h.as_os_str().is_empty())
+            .map(|h| if h.is_dir() { h.join(exe("ffmpeg")) } else { h.to_path_buf() });
+        for c in candidates(hint, exe_dir().as_deref(), &exe("ffmpeg"), cfg!(target_os = "macos")) {
             let Ok(out) = command(&c).arg("-hide_banner").arg("-encoders").output() else { continue };
             if !out.status.success() {
                 continue;
@@ -355,5 +369,86 @@ mod tests {
         let dir = exe_dir_from(Some(appimage.as_os_str()), Some(appdir.as_os_str()), None);
 
         assert_eq!(dir, None);
+    }
+
+    #[test]
+    fn candidates_outside_macos_are_the_hint_then_the_exe_folder_then_path() {
+        let (hint, exe_dir) = (PathBuf::from("/tools/bin/ffmpeg.exe"), PathBuf::from("/apps/loudnorm"));
+
+        let cands = candidates(Some(hint), Some(&exe_dir), "ffmpeg.exe", false);
+
+        assert_eq!(
+            cands,
+            vec![
+                PathBuf::from("/tools/bin/ffmpeg.exe"),
+                PathBuf::from("/apps/loudnorm/ffmpeg.exe"),
+                PathBuf::from("ffmpeg.exe"),
+            ]
+        );
+    }
+
+    #[test]
+    fn candidates_outside_macos_without_a_hint_are_the_exe_folder_then_path() {
+        let exe_dir = PathBuf::from("/apps/loudnorm");
+
+        let cands = candidates(None, Some(&exe_dir), "ffmpeg", false);
+
+        assert_eq!(cands, vec![PathBuf::from("/apps/loudnorm/ffmpeg"), PathBuf::from("ffmpeg")]);
+    }
+
+    #[test]
+    fn candidates_outside_macos_without_an_exe_folder_are_the_hint_then_path() {
+        let hint = PathBuf::from("/tools/bin/ffmpeg");
+
+        let cands = candidates(Some(hint), None, "ffmpeg", false);
+
+        assert_eq!(cands, vec![PathBuf::from("/tools/bin/ffmpeg"), PathBuf::from("ffmpeg")]);
+    }
+
+    #[test]
+    fn candidates_on_macos_leave_out_the_exe_folder() {
+        let exe_dir = PathBuf::from("/Applications/loudnorm.app/Contents/MacOS");
+
+        let cands = candidates(None, Some(&exe_dir), "ffmpeg", true);
+
+        assert_eq!(
+            cands,
+            vec![
+                PathBuf::from("ffmpeg"),
+                PathBuf::from("/opt/homebrew/bin/ffmpeg"),
+                PathBuf::from("/usr/local/bin/ffmpeg"),
+            ]
+        );
+    }
+
+    #[test]
+    fn candidates_on_macos_are_path_then_apple_silicon_homebrew_then_intel_homebrew() {
+        let cands = candidates(None, None, "ffmpeg", true);
+
+        assert_eq!(
+            cands,
+            vec![
+                PathBuf::from("ffmpeg"),
+                PathBuf::from("/opt/homebrew/bin/ffmpeg"),
+                PathBuf::from("/usr/local/bin/ffmpeg"),
+            ]
+        );
+    }
+
+    #[test]
+    fn candidates_on_macos_start_with_the_hint() {
+        let hint = PathBuf::from("/Users/u/bin/ffmpeg");
+
+        let cands = candidates(Some(hint), None, "ffmpeg", true);
+
+        assert_eq!(
+            cands,
+            vec![
+                PathBuf::from("/Users/u/bin/ffmpeg"),
+                PathBuf::from("ffmpeg"),
+                PathBuf::from("/opt/homebrew/bin/ffmpeg"),
+                PathBuf::from("/usr/local/bin/ffmpeg"),
+            ]
+        );
     }
 }

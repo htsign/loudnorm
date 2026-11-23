@@ -66,6 +66,8 @@ cargo build --release
 
 - **ffmpeg と ffprobe**（再エンコードと、Opus など一部形式の解析に使用）
   - PATH 上、exe と同じフォルダ（AppImage では AppImage のあるフォルダ）、または「設定」→「環境設定…」で指定した場所から探します。
+    - exe と同じフォルダを探すのは Windows と Linux です。
+    - macOS では、PATH の後に Homebrew の場所（`/opt/homebrew/bin`、`/usr/local/bin`）も探します。
   - MP3 の再エンコードには libmp3lame、Vorbis には libvorbis を含むビルドが必要です（起動時に検出し、ない場合はその形式だけ失敗します）。
 - 解析は MP3・FLAC・AAC-LC・ALAC・Vorbis・WAV なら ffmpeg なしでも動きます（Opus と HE-AAC は ffmpeg が必要）。ffmpeg なしで適用できるのは「無劣化を優先」の MP3 と「ReplayGain タグだけ」です。
 
