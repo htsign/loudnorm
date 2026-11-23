@@ -15,7 +15,8 @@
 | `src/settings.rs` | 設定ファイル（INI）の読み書き |
 | `src/update.rs` | 更新の確認（GitHub Releases の最新版の取得と版の比較） |
 | `build.rs` | Windows で exe にアイコン（`assets/icon.ico`）を埋め込む |
-| `assets/` | アイコン（SVG 原画、.ico / .icns / .png、それらを作る `make_icons.js`） |
+| `assets/` | アイコン（SVG 原画、.ico / .icns / .png） |
+| `tools/make_icons/` | アイコンを SVG から作り直す Rust 製ツール（resvg）。本体のビルドには含まれず、独自の `Cargo.toml` / `Cargo.lock` を持つ |
 | `packaging/` | 配布物の素材（Linux の `.desktop` と AppImage を作る `make-appimage.sh`、macOS の `Info.plist` の雛形） |
 
 ## バージョンとリリース
@@ -54,7 +55,8 @@
 ### UI
 - exe（`build.rs` が `assets/icon.ico` を Windows リソースとして埋め込む）とウィンドウ（`assets/icon-256.png`）には、同じ `assets/` のアイコンを使う。
   - 原画は `icon.svg`（棒 4 本）と `icon-small.svg`（棒 3 本。16 px でも棒を見分けられるよう減らした）。
-  - SVG を直したら `NODE_PATH=<dir>/node_modules node assets/make_icons.js` で `icon.ico`・`icon.icns`・`icon-256.png` を作り直す（Node.js と playwright + Chromium が要る。リポジトリ外の `<dir>` に入れる。入れ方はスクリプト冒頭）。
+  - SVG を直したら、リポジトリのルートで `cargo run --release --locked --manifest-path tools/make_icons/Cargo.toml` を実行し、`icon.ico`・`icon.icns`・`icon-256.png` を作り直す。
+    - 描画は resvg（ブラウザや Node.js は要らない）。同じサイズと SVG の画像は 1 度だけ描いて共有する。同じ CPU アーキテクチャと同じ `Cargo.lock` なら同じバイト列になる（コミット済みの資産は x86_64 で作ったもの）。
     - 16・20・24・32 px は `icon-small.svg`、40・48・64・256 px と `icon-256.png` は `icon.svg` から作る（20・40・64 px は Windows の拡大表示用）。
     - `.ico` の各エントリは PNG で、256 px のエントリは `icon-256.png` と同一にする。
     - `.icns`（macOS の `.app` 用）は PNG のエントリ `ic07`〜`ic14`（32〜1024 px）を持ち、SVG の選び方は `.ico` と同じ。`ic08`・`ic13`（256 px）は `icon-256.png` と同一にする。

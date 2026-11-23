@@ -225,10 +225,12 @@ mod tests {
     }
 
     #[test]
-    fn app_bundle_icon_256px_entry_is_the_window_icon() {
+    fn app_bundle_icon_256px_entries_are_the_window_icon() {
         let entries = icns_entries(ICON_ICNS);
 
-        let (_, png) = entries.iter().find(|(kind, _)| kind == "ic08").expect("ic08 entry");
-        assert_eq!(*png, ICON_PNG);
+        for want in ["ic08", "ic13"] {
+            let (_, png) = entries.iter().find(|(kind, _)| kind == want).unwrap_or_else(|| panic!("{want} entry"));
+            assert_eq!(*png, ICON_PNG, "{want} must be the window icon");
+        }
     }
 }

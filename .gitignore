@@ -2,5 +2,4 @@
 /target-*
 *.loudnorm-tmp.*
 __pycache__/
-/node_modules/
-/package*.json
+/tools/make_icons/target
