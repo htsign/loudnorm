@@ -12,7 +12,7 @@ use crate::apply::{self, ApplyOptions, Mp3Encode, Output};
 use crate::core::{self, Action, Method, PlanOptions, Stats, Target, Track};
 use crate::ffmpeg::Ffmpeg;
 use crate::settings::Settings;
-use crate::update::{self, Release, Version};
+use crate::update::{self, Outcome, Version};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
@@ -21,14 +21,12 @@ enum Phase {
     Applying,
 }
 
-/// Where the check for a newer release stands.
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum UpdateState {
-    NotChecked,
-    Checking,
-    UpToDate,
-    Available(Release),
-    Failed(String),
+/// Where the check for a newer release stands. `outcome` is what the last finished check found and
+/// stays while the next one runs, so the dialog does not swap its result for a "checking" text.
+#[derive(Clone, Debug)]
+struct UpdateStatus {
+    checking: bool,
+    outcome: Outcome,
 }
 
 struct Shared {
@@ -76,7 +74,7 @@ pub struct App {
     show_prefs: bool,
     show_about: bool,
     /// Written by the update-check thread, read by the UI.
-    update: Arc<Mutex<UpdateState>>,
+    update: Arc<Mutex<UpdateStatus>>,
     /// Frame number (`Context::cumulative_frame_nr`) from which the folder picker chosen in the menu may open.
     open_folder_at: Option<u64>,
 }
@@ -437,7 +435,7 @@ impl App {
             density_cache: DensityCache::default(),
             show_prefs: false,
             show_about: false,
-            update: Arc::new(Mutex::new(UpdateState::NotChecked)),
+            update: Arc::new(Mutex::new(UpdateStatus { checking: false, outcome: Outcome::NotChecked })),
             open_folder_at: None,
         };
         if app.check_updates {
@@ -450,22 +448,22 @@ impl App {
     fn start_update_check(&self, ctx: &egui::Context) {
         {
             let mut st = self.update.lock().unwrap();
-            if *st == UpdateState::Checking {
+            if st.checking {
                 return;
             }
-            *st = UpdateState::Checking;
+            st.checking = true;
         }
-        let (state, ctx) = (self.update.clone(), ctx.clone());
+        let (status, ctx) = (self.update.clone(), ctx.clone());
         std::thread::spawn(move || {
-            let result = match Version::parse(env!("CARGO_PKG_VERSION")) {
-                None => UpdateState::Failed("現在のバージョンを読み取れません".into()),
-                Some(current) => match update::fetch_latest() {
-                    Ok(r) if update::is_newer(&r.version, &current) => UpdateState::Available(r),
-                    Ok(_) => UpdateState::UpToDate,
-                    Err(e) => UpdateState::Failed(format!("{e:#}")),
-                },
+            let fetched = Version::parse(env!("CARGO_PKG_VERSION"))
+                .map(|current| (current, update::fetch_latest().map_err(|e| format!("{e:#}"))));
+            let mut st = status.lock().unwrap();
+            st.outcome = match fetched {
+                None => Outcome::Failed("現在のバージョンを読み取れません".into()),
+                Some((current, result)) => update::next_outcome(&st.outcome, &current, result),
             };
-            *state.lock().unwrap() = result;
+            st.checking = false;
+            drop(st);
             ctx.request_repaint();
         });
     }
@@ -848,8 +846,8 @@ impl App {
                     self.show_about = true;
                 }
             });
-            let available = match &*self.update.lock().unwrap() {
-                UpdateState::Available(r) => Some(r.version),
+            let available = match &self.update.lock().unwrap().outcome {
+                Outcome::Available(r) => Some(r.version),
                 _ => None,
             };
             if let Some(v) = available {
@@ -891,28 +889,28 @@ impl App {
             let resp = egui::Modal::new(egui::Id::unique("loudnorm-about")).show(ctx, |ui| {
                 ui.set_max_width(460.0);
                 ui.heading("loudnorm");
-                ui.label(format!("現在のバージョン {}", env!("CARGO_PKG_VERSION")));
+                ui.label(format!("現在のバージョン v{}", env!("CARGO_PKG_VERSION")));
                 ui.add_space(8.0);
-                let state = self.update.lock().unwrap().clone();
-                match &state {
-                    UpdateState::NotChecked => {}
-                    UpdateState::Checking => {
-                        ui.label("確認中…");
-                    }
-                    UpdateState::UpToDate => {
+                let status = self.update.lock().unwrap().clone();
+                match &status.outcome {
+                    Outcome::NotChecked => {}
+                    Outcome::UpToDate => {
                         ui.label("最新版です");
                     }
-                    UpdateState::Available(r) => {
-                        ui.label(RichText::new(format!("現在 {} → 最新 {}", env!("CARGO_PKG_VERSION"), r.version)).strong().color(ACCENT));
+                    Outcome::Available(r) => {
+                        ui.label(RichText::new(format!("現在 v{} → 最新 v{}", env!("CARGO_PKG_VERSION"), r.version)).strong().color(ACCENT));
                         ui.hyperlink_to("リリースページを開く", &r.url);
                     }
-                    UpdateState::Failed(e) => {
+                    Outcome::Failed(e) => {
                         ui.label(RichText::new(format!("確認できませんでした: {e}")).color(WARN));
                     }
                 }
-                if ui.add_enabled(state != UpdateState::Checking, egui::Button::new("更新を確認")).clicked() {
-                    self.start_update_check(ctx);
-                }
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(!status.checking, egui::Button::new("更新を確認")).clicked() {
+                        self.start_update_check(ctx);
+                    }
+                    ui.add_visible(status.checking, egui::Label::new("確認中…"));
+                });
                 ui.add_space(8.0);
                 if ui.button("閉じる").clicked() {
                     ui.close();

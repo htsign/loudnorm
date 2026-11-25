@@ -9,6 +9,10 @@ use serde::Deserialize;
 /// The API endpoint that describes the latest published (non-draft, non-prerelease) release.
 const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/htsign/loudnorm/releases/latest";
 
+/// Every URL taken from a release (its page) must start with this, so a response cannot point the
+/// app at another site or repository.
+const RELEASES_URL_PREFIX: &str = "https://github.com/htsign/loudnorm/releases/";
+
 /// Upper bound for the whole request (connect, send and read).
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -79,18 +83,54 @@ struct ReleaseJson {
 }
 
 /// Reads a GitHub "release" response. `None` when the body is not valid JSON, is a draft or a
-/// pre-release, or has no usable `tag_name` / `html_url` (e.g. a "Not Found" error body).
+/// pre-release, has no usable `tag_name` / `html_url` (e.g. a "Not Found" error body), or when its
+/// `html_url` is not a release page of this repository.
 pub fn latest_from_json(body: &str) -> Option<Release> {
     let r: ReleaseJson = serde_json::from_str(body).ok()?;
     if r.draft || r.prerelease {
         return None;
     }
-    Some(Release { version: Version::parse(&r.tag_name?)?, url: r.html_url? })
+    let url = r.html_url.filter(|u| is_release_url(u))?;
+    Some(Release { version: Version::parse(&r.tag_name?)?, url })
+}
+
+/// Whether `u` is a page under this repository's releases that a browser or HTTP client resolves
+/// to the same place the text says. Only ASCII letters, digits and `-._/` may follow the prefix, so
+/// a query, a fragment, a backslash or a percent-encoded `..` cannot be used to leave the
+/// repository, and no path segment may be empty, `.` or `..`.
+fn is_release_url(u: &str) -> bool {
+    let Some(rest) = u.strip_prefix(RELEASES_URL_PREFIX) else {
+        return false;
+    };
+    rest.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'/'))
+        && rest.split('/').all(|seg| !matches!(seg, "" | "." | ".."))
 }
 
 /// Whether `latest` is strictly greater than `current`.
 pub fn is_newer(latest: &Version, current: &Version) -> bool {
     latest > current
+}
+
+/// What the last finished check found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    NotChecked,
+    UpToDate,
+    Available(Release),
+    Failed(String),
+}
+
+/// The outcome after a check finishes; `result` is the fetched release or the error message.
+/// A failed re-check keeps an already known newer release instead of replacing it with the failure.
+pub fn next_outcome(prev: &Outcome, current: &Version, result: Result<Release, String>) -> Outcome {
+    match result {
+        Ok(r) if is_newer(&r.version, current) => Outcome::Available(r),
+        Ok(_) => Outcome::UpToDate,
+        Err(e) => match prev {
+            Outcome::Available(_) => prev.clone(),
+            _ => Outcome::Failed(e),
+        },
+    }
 }
 
 /// Asks GitHub for the latest release. Blocks until the answer arrives or the request times out, so
@@ -246,5 +286,122 @@ mod tests {
         assert!(is_newer(&v(0, 3, 1), &current), "newer");
         assert!(!is_newer(&v(0, 3, 0), &current), "equal");
         assert!(!is_newer(&v(0, 2, 9), &current), "older");
+    }
+
+    /// `release_json` for `v0.4.0` with the release's own `html_url` replaced by `page`.
+    fn release_json_with_page(page: &str) -> String {
+        let mut json: serde_json::Value = serde_json::from_str(&release_json("v0.4.0", false, false)).unwrap();
+        json["html_url"] = page.into();
+        json.to_string()
+    }
+
+    #[test]
+    fn latest_from_json_returns_none_when_page_is_not_a_release_of_this_repository() {
+        for page in [
+            "https://example.com/htsign/loudnorm/releases/tag/v0.4.0",
+            "https://github.com/evil/loudnorm/releases/tag/v0.4.0",
+            "https://github.com/htsign/loudnorm-evil/releases/tag/v0.4.0",
+            "http://github.com/htsign/loudnorm/releases/tag/v0.4.0",
+            "https://github.com.evil.example/htsign/loudnorm/releases/tag/v0.4.0",
+            "https://github.com@evil.example/htsign/loudnorm/releases/tag/v0.4.0",
+            "https://github.com/htsign/loudnorm/releases/../../evil/loudnorm/releases/tag/v0.4.0",
+            "https://github.com/htsign/loudnorm/releases/%2e%2e/%2e%2e/evil/loudnorm/releases/tag/v0.4.0",
+            r"https://github.com/htsign/loudnorm/releases/..\..\evil/loudnorm/releases/tag/v0.4.0",
+            "https://github.com/htsign/loudnorm/releases/tag/v0.4.0?x=1",
+            "https://github.com/htsign/loudnorm/releases/tag/v0.4.0#x",
+            "https://github.com/htsign/loudnorm/releases/",
+            "https://github.com/htsign/loudnorm/releases//tag/v0.4.0",
+            "https://github.com/htsign/loudnorm/releases/./tag/v0.4.0",
+            "https://github.com/htsign/loudnorm/releases/tag/v0.4.0/",
+        ] {
+            let r = latest_from_json(&release_json_with_page(page));
+
+            assert_eq!(r, None, "{page}");
+        }
+    }
+
+    fn release(major: u64, minor: u64, patch: u64) -> Release {
+        Release {
+            version: v(major, minor, patch),
+            url: format!("https://github.com/htsign/loudnorm/releases/tag/v{major}.{minor}.{patch}"),
+        }
+    }
+
+    #[test]
+    fn next_outcome_is_available_when_the_fetched_release_is_newer() {
+        let current = v(0, 4, 0);
+
+        let next = next_outcome(&Outcome::NotChecked, &current, Ok(release(0, 5, 0)));
+
+        assert_eq!(next, Outcome::Available(release(0, 5, 0)));
+    }
+
+    #[test]
+    fn next_outcome_replaces_a_known_release_with_a_newer_one() {
+        let current = v(0, 4, 0);
+        let prev = Outcome::Available(release(0, 5, 0));
+
+        let next = next_outcome(&prev, &current, Ok(release(0, 6, 0)));
+
+        assert_eq!(next, Outcome::Available(release(0, 6, 0)));
+    }
+
+    #[test]
+    fn next_outcome_is_up_to_date_when_the_fetched_release_is_the_current_version() {
+        let current = v(0, 4, 0);
+
+        let next = next_outcome(&Outcome::NotChecked, &current, Ok(release(0, 4, 0)));
+
+        assert_eq!(next, Outcome::UpToDate);
+    }
+
+    #[test]
+    fn next_outcome_is_up_to_date_when_the_fetched_release_is_older() {
+        let current = v(0, 4, 0);
+
+        let next = next_outcome(&Outcome::NotChecked, &current, Ok(release(0, 3, 9)));
+
+        assert_eq!(next, Outcome::UpToDate);
+    }
+
+    #[test]
+    fn next_outcome_is_up_to_date_when_a_known_release_is_no_longer_newer() {
+        let current = v(0, 4, 0);
+        let prev = Outcome::Available(release(0, 5, 0));
+
+        let next = next_outcome(&prev, &current, Ok(release(0, 4, 0)));
+
+        assert_eq!(next, Outcome::UpToDate);
+    }
+
+    #[test]
+    fn next_outcome_is_available_when_a_recheck_succeeds_after_a_failure() {
+        let current = v(0, 4, 0);
+        let prev = Outcome::Failed("通信に失敗しました".into());
+
+        let next = next_outcome(&prev, &current, Ok(release(0, 5, 0)));
+
+        assert_eq!(next, Outcome::Available(release(0, 5, 0)));
+    }
+
+    #[test]
+    fn next_outcome_keeps_the_known_release_when_a_recheck_fails() {
+        let current = v(0, 4, 0);
+        let prev = Outcome::Available(release(0, 5, 0));
+
+        let next = next_outcome(&prev, &current, Err("通信に失敗しました".into()));
+
+        assert_eq!(next, Outcome::Available(release(0, 5, 0)));
+    }
+
+    #[test]
+    fn next_outcome_is_failed_with_the_message_when_no_release_is_known() {
+        let current = v(0, 4, 0);
+
+        for prev in [Outcome::NotChecked, Outcome::UpToDate, Outcome::Failed("前回の失敗".into())] {
+            let next = next_outcome(&prev, &current, Err("通信に失敗しました".into()));
+
+            assert_eq!(next, Outcome::Failed("通信に失敗しました".into()), "{prev:?}");
+        }
     }
 }
