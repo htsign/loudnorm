@@ -1,6 +1,6 @@
 # Reusable: test, build and package loudnorm for every supported platform.
 # Each job uploads one artifact named "loudnorm-<target>" holding a .zip (Windows: exe + README; macOS: loudnorm.app
-# + README) or an .AppImage (Linux).
+# + README) or a .tar.gz (Linux: loudnorm.AppImage + README).
 name: Build
 
 on:
@@ -115,7 +115,9 @@ jobs:
           ls --format=long
 
       # AppDir layout and the AppImage tools: see packaging/linux/make-appimage.sh.
-      - name: Package (Linux AppImage)
+      # The AppImage, named loudnorm.AppImage without the version, goes into a .tar.gz (a zip may lose the executable bit when unpacked),
+      # so that replacing it in place keeps its <AppImage>.config folder (see --appimage-portable-config).
+      - name: Package (Linux tar.gz with AppImage)
         if: runner.os == 'Linux'
         env:
           APPIMAGE_ARCH: ${{ matrix.appimage_arch }}
@@ -123,7 +125,7 @@ jobs:
           RUNTIME_SHA256: ${{ matrix.runtime_sha256 }}
         run: |
           name="${{ steps.pkg.outputs.name }}"
-          mkdir --parents dist "$RUNNER_TEMP/appimage"
+          mkdir --parents "dist/$name" "$RUNNER_TEMP/appimage"
           tools="$RUNNER_TEMP/appimage"
           curl --fail --silent --show-error --location --output "$tools/appimagetool" \
             "https://github.com/AppImage/appimagetool/releases/download/$APPIMAGETOOL_VERSION/appimagetool-$APPIMAGE_ARCH.AppImage"
@@ -133,23 +135,37 @@ jobs:
           echo "$RUNTIME_SHA256  $tools/runtime" | sha256sum --check
           chmod +x "$tools/appimagetool"
           bash packaging/linux/make-appimage.sh "target/${{ matrix.target }}/release/loudnorm" assets/icon-256.png \
-            packaging/linux/loudnorm.desktop "$tools/appimagetool" "$tools/runtime" "dist/$name.AppImage"
+            packaging/linux/loudnorm.desktop "$tools/appimagetool" "$tools/runtime" "dist/$name/loudnorm.AppImage"
+          cp README.md "dist/$name/"
+          # Without the owner and group of the build machine in the archive.
+          tar --create --gzip --owner=0 --group=0 --numeric-owner --sort=name --file="dist/$name.tar.gz" --directory=dist "$name"
+          rm --recursive --force "dist/$name"
 
           # The runtime is static, so the AppImage needs no more glibc than the binary inside; check that it stays so.
           if readelf --dynamic "$tools/runtime" | grep --quiet NEEDED; then
             echo "::error::the AppImage runtime is not static any more"
             exit 1
           fi
-          # Unpack it (no FUSE on the runner) and check the entries the AppDir specification requires.
-          cd "$RUNNER_TEMP"
-          rm --recursive --force squashfs-root
-          "$GITHUB_WORKSPACE/dist/$name.AppImage" --appimage-extract
+          # The archive holds exactly the folder, the README and the AppImage (diff fails the step otherwise).
+          diff <(tar --list --gzip --file="dist/$name.tar.gz" | LC_ALL=C sort) \
+            <(printf '%s\n' "$name/" "$name/README.md" "$name/loudnorm.AppImage" | LC_ALL=C sort)
+          # Unpack the archive as a user would, and check that the AppImage is executable and the README is there.
+          check="$RUNNER_TEMP/tarball-check"
+          rm --recursive --force "$check"
+          mkdir --parents "$check/extract"
+          tar --extract --gzip --file="dist/$name.tar.gz" --directory="$check"
+          test -x "$check/$name/loudnorm.AppImage"
+          test -f "$check/$name/README.md"
+          # Unpack the AppImage (no FUSE on the runner) and check the entries the AppDir specification requires.
+          cd "$check/extract"
+          "$check/$name/loudnorm.AppImage" --appimage-extract
           test -x squashfs-root/AppRun
           test -f squashfs-root/loudnorm.desktop
           test -f squashfs-root/loudnorm.png
           test -L squashfs-root/.DirIcon
           cmp squashfs-root/.DirIcon "$GITHUB_WORKSPACE/assets/icon-256.png"
           cmp squashfs-root/usr/bin/loudnorm "$GITHUB_WORKSPACE/target/${{ matrix.target }}/release/loudnorm"
+          tar --list --verbose --gzip --file="$GITHUB_WORKSPACE/dist/$name.tar.gz"
           ls --format=long "$GITHUB_WORKSPACE/dist"
 
       - name: Package (macOS app bundle)

@@ -31,7 +31,10 @@
 - 配布形式は OS ごとに決まっている（ファイル名は `loudnorm-v<version>-<target>.<拡張子>`）。
   - Windows: exe と README の zip。
   - macOS: `loudnorm.app`（`packaging/macos/Info.plist` の雛形に版と最低 OS 版を埋め、`assets/icon.icns` を入れる）と README を `ditto` で zip にしたもの。Developer ID の署名・公証はしない（ad-hoc 署名のみ）。
-  - Linux: AppImage（`packaging/linux/make-appimage.sh`）。AppDir は仕様どおり `AppRun`・`.desktop`・アイコン・`.DirIcon`（アイコンへのシンボリックリンク）を持つ。
+  - Linux: AppImage（`packaging/linux/make-appimage.sh`）を入れた tar.gz（zip だと展開ツールによっては実行権限が落ちるため）。AppDir は仕様どおり `AppRun`・`.desktop`・アイコン・`.DirIcon`（アイコンへのシンボリックリンク）を持つ。
+    - 中身は `loudnorm-v<version>-<target>/` に `loudnorm.AppImage` と README。
+    - AppImage の名前に版を入れない（同じ場所で差し替えれば、`<AppImage>.config` が版をまたいで変わらないため）。
+    - tar にビルド機の所有者情報は入れず、項目を名前順に並べる（`--owner=0 --group=0 --numeric-owner --sort=name`）。
     - appimagetool と AppImage のランタイムは版を固定し、ダウンロードの sha256 を `build.yml` のマトリクスに書いて検証する。上げるときは両方更新する。
     - ランタイムは静的リンクで、glibc の下限を上げず、libfuse2 も要らない。
 - 作業はブランチで行う。`main` 以外への push でも `ci.yml` が同じビルドとテストを全プラットフォームで実行する。
