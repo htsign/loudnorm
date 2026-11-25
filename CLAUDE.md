@@ -23,15 +23,22 @@
 
 - 変更のたびに `Cargo.toml` の `version` を上げ、`Cargo.lock` も更新する（CI は `--locked` でビルドする）。
   - バグ修正などの軽微な変更: パッチ（3 桁目）
-  - 機能追加: マイナー（2 桁目）
+  - 機能追加: マイナー（2 桁目。3 桁目は 0 に戻す）
   - UI の根本的な変更、計算アルゴリズムの一新などの大きな変更: メジャー（1 桁目）
+  - `develop` に入れるプルリクエストごとに、その変更の種類に応じて `develop` の版から上げる。
+    - `develop` の版がすでに `main` より上がっていても重ねて上げる。次のリリースに入る変更をまとめて 1 回だけ上げることはしない。
+    - 例: `main` が 0.4.0 のとき、アイコンの調整 → 0.4.1、配布形式の変更 → 0.4.2、自己更新の追加 → 0.5.0。リリースは 0.5.0 だが、0.4.x を経た上でのマイナー更新として扱う。
+    - 理由: 版の数字から変更の数が分かるようにするため（0.5.2 なら、0.5.0 の後に修正が 2 件あったと分かる）。
   - CI やドキュメントだけの変更では上げなくてよい。
 - `main` に push され、その版のリリースがまだなければ `release.yml` が全プラットフォームをビルドして `v<version>` を Releases に登録する。
 - 配布対象は最低限 Windows x64 と Linux x64。加えて Windows ARM64、Linux ARM64、macOS（Intel / Apple シリコン）も出す。Linux は cargo-zigbuild で glibc 2.17 を下限にリンクし、ランナーの Ubuntu の版に依存させない（CI で必要な glibc の版を検査する）。
 - 配布形式は OS ごとに決まっている（ファイル名は `loudnorm-v<version>-<target>.<拡張子>`）。
   - Windows: exe と README の zip。
   - macOS: `loudnorm.app`（`packaging/macos/Info.plist` の雛形に版と最低 OS 版を埋め、`assets/icon.icns` を入れる）と README を `ditto` で zip にしたもの。Developer ID の署名・公証はしない（ad-hoc 署名のみ）。
-  - Linux: AppImage（`packaging/linux/make-appimage.sh`）。AppDir は仕様どおり `AppRun`・`.desktop`・アイコン・`.DirIcon`（アイコンへのシンボリックリンク）を持つ。
+  - Linux: AppImage（`packaging/linux/make-appimage.sh`）を入れた tar.gz（zip だと展開ツールによっては実行権限が落ちるため）。AppDir は仕様どおり `AppRun`・`.desktop`・アイコン・`.DirIcon`（アイコンへのシンボリックリンク）を持つ。
+    - 中身は `loudnorm-v<version>-<target>/` に `loudnorm.AppImage` と README。
+    - AppImage の名前に版を入れない（同じ場所で差し替えれば、`<AppImage>.config` が版をまたいで変わらないため）。
+    - tar にビルド機の所有者情報は入れず、項目を名前順に並べる（`--owner=0 --group=0 --numeric-owner --sort=name`）。
     - appimagetool と AppImage のランタイムは版を固定し、ダウンロードの sha256 を `build.yml` のマトリクスに書いて検証する。上げるときは両方更新する。
     - ランタイムは静的リンクで、glibc の下限を上げず、libfuse2 も要らない。
 - 作業はブランチで行う。`main` 以外への push でも `ci.yml` が同じビルドとテストを全プラットフォームで実行する。
@@ -71,8 +78,10 @@
   - 場所は Windows が `%APPDATA%\loudnorm\settings.ini`、Linux / macOS が `$XDG_CONFIG_HOME/loudnorm/settings.ini`（未設定なら `~/.config/loudnorm/settings.ini`）。exe と同じフォルダに `settings.ini` があればそちらを優先する。
     - AppImage では隣の `settings.ini` は読まない（他のアプリと同じフォルダに置かれやすく、別のアプリの設定を上書きしうるため）。
       - 持ち運び用は AppImage 標準の `--appimage-portable-config`（`XDG_CONFIG_HOME` を `<AppImage>.config` に向ける）に任せる。
+    - macOS では exe のフォルダ（`.app` の中）の `settings.ini` を見ない（署名済みのバンドルにファイルを足すと署名が壊れ、隔離されたまま起動したときは `.app` の隣も見えないため）。
 - ffmpeg の場所は「設定」→「環境設定…」のダイアログで、フォルダ選択とファイル選択の両方で指定できるようにする。
   - ffmpeg の探索では、`APPDIR` の下で動いているときだけ、`APPIMAGE` の親フォルダを exe のフォルダとして扱う（`ffmpeg::exe_dir`）。
+  - macOS では exe のフォルダを探さず、PATH の後に Homebrew の 2 か所（`/opt/homebrew/bin`、`/usr/local/bin`）を探す（Finder から起動した GUI アプリの PATH に Homebrew の場所は入らないため）。
 
 ### 処理
 - 解析と適用は曲単位で並列に実行する。並列数の既定は論理コア数 − 1（最低 1）。

@@ -2,13 +2,14 @@
 //!
 //! Location: `settings.ini` next to the exe if that file exists (portable use), otherwise
 //! `%APPDATA%\loudnorm\settings.ini` on Windows and `$XDG_CONFIG_HOME/loudnorm/settings.ini`
-//! (or `~/.config/...`) elsewhere. Lines starting with `;` or `#` are comments.
+//! (or `~/.config/...`) elsewhere. On macOS the exe is inside the `.app` bundle, so no `settings.ini`
+//! is looked for next to it. Lines starting with `;` or `#` are comments.
 //! Inside an AppImage the exe sits in a mount point or a temporary extraction, so no `settings.ini`
 //! is found next to it (use the AppImage's `--appimage-portable-config`, which points
 //! `XDG_CONFIG_HOME` elsewhere).
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::apply::Mp3Encode;
 use crate::core::{Method, Target};
@@ -80,12 +81,14 @@ impl Default for Settings {
     }
 }
 
+const FILE_NAME: &str = "settings.ini";
+
 pub fn path() -> Option<PathBuf> {
-    let name = "settings.ini";
-    if let Some(p) = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join(name))) {
-        if p.is_file() {
-            return Some(p);
-        }
+    let exe = std::env::current_exe().ok();
+    if let Some(p) = portable_path(exe.as_deref().and_then(Path::parent), cfg!(target_os = "macos"))
+        && p.is_file()
+    {
+        return Some(p);
     }
     let base = if cfg!(windows) {
         std::env::var_os("APPDATA").map(PathBuf::from)
@@ -94,7 +97,16 @@ pub fn path() -> Option<PathBuf> {
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
     }?;
-    Some(base.join("loudnorm").join(name))
+    Some(base.join("loudnorm").join(FILE_NAME))
+}
+
+/// `settings.ini` in the exe's folder, for portable use. On macOS the exe is inside the `.app` bundle,
+/// so there is none (adding a file there breaks the signature, and a quarantined app is run from a hidden location).
+fn portable_path(exe_dir: Option<&Path>, macos: bool) -> Option<PathBuf> {
+    if macos {
+        return None;
+    }
+    exe_dir.map(|d| d.join(FILE_NAME))
 }
 
 fn method_str(m: Method) -> &'static str {
@@ -118,7 +130,7 @@ impl Settings {
         format!(
             "; loudnorm の設定（終了時ではなく、変更するたびに保存されます）\n\
              [general]\n\
-             ; ffmpeg のあるフォルダ、または ffmpeg 本体のパス（空なら PATH と exe のフォルダを探す）\n\
+             ; ffmpeg のあるフォルダ、または ffmpeg 本体のパス（空なら PATH などから自動で探す）\n\
              ffmpeg = {}\n\
              last_folder = {}\n\
              \n\
@@ -433,5 +445,30 @@ mod tests {
 
         assert!(!r.check_updates);
         assert!(bad.is_empty(), "{bad:?}");
+    }
+
+    #[test]
+    fn portable_path_outside_macos_is_settings_ini_in_the_exe_folder() {
+        let exe_dir = PathBuf::from("/apps/loudnorm");
+
+        let p = portable_path(Some(&exe_dir), false);
+
+        assert_eq!(p, Some(PathBuf::from("/apps/loudnorm/settings.ini")));
+    }
+
+    #[test]
+    fn portable_path_outside_macos_is_none_without_an_exe_folder() {
+        let p = portable_path(None, false);
+
+        assert_eq!(p, None);
+    }
+
+    #[test]
+    fn portable_path_on_macos_is_none_even_with_an_exe_folder() {
+        let exe_dir = PathBuf::from("/Applications/loudnorm.app/Contents/MacOS");
+
+        let p = portable_path(Some(&exe_dir), true);
+
+        assert_eq!(p, None);
     }
 }
