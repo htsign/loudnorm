@@ -13,6 +13,10 @@ const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/htsign/loudnorm/r
 /// app at another site or repository.
 const RELEASES_URL_PREFIX: &str = "https://github.com/htsign/loudnorm/releases/";
 
+/// Every download URL of a release file is this followed by `v<version>/<file name>`, for the same
+/// reason.
+const DOWNLOAD_URL_PREFIX: &str = "https://github.com/htsign/loudnorm/releases/download/";
+
 /// Upper bound for the whole request (connect, send and read).
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -62,6 +66,15 @@ impl PartialOrd for Version {
     }
 }
 
+/// A file attached to a release.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Asset {
+    /// The file name (`name`).
+    pub name: String,
+    /// Where the file is downloaded from (`browser_download_url`).
+    pub url: String,
+}
+
 /// The latest published release.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Release {
@@ -69,6 +82,8 @@ pub struct Release {
     pub version: Version,
     /// The release's page on GitHub (`html_url`).
     pub url: String,
+    /// The files attached to the release.
+    pub assets: Vec<Asset>,
 }
 
 /// The fields of GitHub's release object that are used; the rest of the response is ignored.
@@ -80,6 +95,14 @@ struct ReleaseJson {
     draft: bool,
     #[serde(default)]
     prerelease: bool,
+    assets: Option<Vec<AssetJson>>,
+}
+
+/// The fields of a release's file that are used.
+#[derive(Deserialize)]
+struct AssetJson {
+    name: Option<String>,
+    browser_download_url: Option<String>,
 }
 
 /// Reads a GitHub "release" response. `None` when the body is not valid JSON, is a draft or a
@@ -91,7 +114,13 @@ pub fn latest_from_json(body: &str) -> Option<Release> {
         return None;
     }
     let url = r.html_url.filter(|u| is_release_url(u))?;
-    Some(Release { version: Version::parse(&r.tag_name?)?, url })
+    let assets = r
+        .assets
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|a| Some(Asset { name: a.name?, url: a.browser_download_url? }))
+        .collect();
+    Some(Release { version: Version::parse(&r.tag_name?)?, url, assets })
 }
 
 /// Whether `u` is a page under this repository's releases that a browser or HTTP client resolves
@@ -109,6 +138,55 @@ fn is_release_url(u: &str) -> bool {
 /// Whether `latest` is strictly greater than `current`.
 pub fn is_newer(latest: &Version, current: &Version) -> bool {
     latest > current
+}
+
+/// The name of the release file for `target` (`loudnorm-v<version>-<target>.<zip|tar.gz>`), or
+/// `None` when `target` is not a Windows MSVC, macOS or Linux GNU target.
+pub fn asset_name(version: &Version, target: &str) -> Option<String> {
+    let ext = if target.ends_with("-pc-windows-msvc") || target.ends_with("-apple-darwin") {
+        "zip"
+    } else if target.ends_with("-unknown-linux-gnu") {
+        "tar.gz"
+    } else {
+        return None;
+    };
+    Some(format!("loudnorm-v{version}-{target}.{ext}"))
+}
+
+/// The download URL of the asset named exactly `name`, or `None` when there is no such asset or its
+/// URL is not exactly this repository's download URL of `name` under the release's own tag (the
+/// workflow tags every release `v<version>`), so a response cannot point at an older release.
+pub fn download_url<'a>(release: &'a Release, name: &str) -> Option<&'a str> {
+    let asset = release.assets.iter().find(|a| a.name == name)?;
+    let expected = format!("{DOWNLOAD_URL_PREFIX}v{}/{name}", release.version);
+    (asset.url == expected).then_some(asset.url.as_str())
+}
+
+/// The SHA-256 of `file` listed in the text of a `SHA256SUMS.txt` (lines `<hex>  <name>` or
+/// `<hex> *<name>`, as `sha256sum` writes them), or `None` when no valid line names `file`.
+pub fn sha256_from_sums(sums: &str, file: &str) -> Option<[u8; 32]> {
+    sums.split('\n').find_map(|line| {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        let (hex, rest) = line.split_at_checked(64)?;
+        let name = rest.strip_prefix("  ").or_else(|| rest.strip_prefix(" *"))?;
+        if name != file {
+            return None;
+        }
+        decode_sha256(hex)
+    })
+}
+
+/// The 32 bytes written as 64 hex digits (either case), or `None` for any other text.
+fn decode_sha256(hex: &str) -> Option<[u8; 32]> {
+    let digits = hex.bytes().map(|b| char::from(b).to_digit(16)).collect::<Option<Vec<_>>>()?;
+    let mut out = [0u8; 32];
+    if digits.len() != out.len() * 2 {
+        return None;
+    }
+    for (byte, pair) in out.iter_mut().zip(digits.chunks_exact(2)) {
+        *byte = ((pair[0] << 4) | pair[1]) as u8;
+    }
+    Some(out)
 }
 
 /// What the last finished check found.
@@ -192,6 +270,14 @@ mod tests {
       "uploader": {{ "login": "htsign", "html_url": "https://github.com/htsign" }},
       "size": 12345,
       "browser_download_url": "https://github.com/htsign/loudnorm/releases/download/{tag}/loudnorm-v{ver}-x86_64-pc-windows-msvc.zip"
+    }},
+    {{
+      "url": "https://api.github.com/repos/htsign/loudnorm/releases/assets/2002",
+      "name": "SHA256SUMS.txt",
+      "label": null,
+      "uploader": {{ "login": "htsign", "html_url": "https://github.com/htsign" }},
+      "size": 321,
+      "browser_download_url": "https://github.com/htsign/loudnorm/releases/download/{tag}/SHA256SUMS.txt"
     }}
   ]
 }}"###
@@ -245,9 +331,69 @@ mod tests {
         let r = latest_from_json(&release_json("v0.4.0", false, false));
 
         assert_eq!(
-            r,
-            Some(Release { version: v(0, 4, 0), url: "https://github.com/htsign/loudnorm/releases/tag/v0.4.0".into() })
+            r.map(|r| (r.version, r.url)),
+            Some((v(0, 4, 0), "https://github.com/htsign/loudnorm/releases/tag/v0.4.0".to_string()))
         );
+    }
+
+    #[test]
+    fn latest_from_json_takes_each_asset_name_and_download_url_not_nested_urls() {
+        let r = latest_from_json(&release_json("v0.4.0", false, false));
+
+        assert_eq!(
+            r.map(|r| r.assets),
+            Some(vec![
+                Asset {
+                    name: "loudnorm-v0.4.0-x86_64-pc-windows-msvc.zip".into(),
+                    url: "https://github.com/htsign/loudnorm/releases/download/v0.4.0/loudnorm-v0.4.0-x86_64-pc-windows-msvc.zip"
+                        .into(),
+                },
+                Asset {
+                    name: "SHA256SUMS.txt".into(),
+                    url: "https://github.com/htsign/loudnorm/releases/download/v0.4.0/SHA256SUMS.txt".into(),
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn latest_from_json_skips_only_the_assets_without_a_name_or_a_download_url() {
+        let mut json: serde_json::Value = serde_json::from_str(&release_json("v0.4.0", false, false)).unwrap();
+        json["assets"] = serde_json::json!([
+            { "browser_download_url": "https://github.com/htsign/loudnorm/releases/download/v0.4.0/no-name.zip" },
+            { "name": "no-url.zip" },
+            { "name": "SHA256SUMS.txt", "browser_download_url": "https://github.com/htsign/loudnorm/releases/download/v0.4.0/SHA256SUMS.txt" },
+        ]);
+
+        let r = latest_from_json(&json.to_string());
+
+        assert_eq!(
+            r.map(|r| r.assets),
+            Some(vec![Asset {
+                name: "SHA256SUMS.txt".into(),
+                url: "https://github.com/htsign/loudnorm/releases/download/v0.4.0/SHA256SUMS.txt".into(),
+            }])
+        );
+    }
+
+    #[test]
+    fn latest_from_json_has_no_assets_when_assets_is_null() {
+        let mut json: serde_json::Value = serde_json::from_str(&release_json("v0.4.0", false, false)).unwrap();
+        json["assets"] = serde_json::Value::Null;
+
+        let r = latest_from_json(&json.to_string());
+
+        assert_eq!(r.map(|r| r.assets), Some(Vec::new()));
+    }
+
+    #[test]
+    fn latest_from_json_has_no_assets_when_the_response_has_no_assets_key() {
+        let mut json: serde_json::Value = serde_json::from_str(&release_json("v0.4.0", false, false)).unwrap();
+        json.as_object_mut().unwrap().remove("assets");
+
+        let r = latest_from_json(&json.to_string());
+
+        assert_eq!(r.map(|r| r.assets), Some(Vec::new()));
     }
 
     #[test]
@@ -324,6 +470,7 @@ mod tests {
         Release {
             version: v(major, minor, patch),
             url: format!("https://github.com/htsign/loudnorm/releases/tag/v{major}.{minor}.{patch}"),
+            assets: Vec::new(),
         }
     }
 
@@ -403,5 +550,248 @@ mod tests {
 
             assert_eq!(next, Outcome::Failed("通信に失敗しました".into()), "{prev:?}");
         }
+    }
+
+    #[test]
+    fn asset_name_is_a_zip_for_windows_targets() {
+        for target in ["x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"] {
+            let name = asset_name(&v(0, 5, 0), target);
+
+            assert_eq!(name, Some(format!("loudnorm-v0.5.0-{target}.zip")), "{target}");
+        }
+    }
+
+    #[test]
+    fn asset_name_is_a_zip_for_macos_targets() {
+        for target in ["x86_64-apple-darwin", "aarch64-apple-darwin"] {
+            let name = asset_name(&v(0, 5, 0), target);
+
+            assert_eq!(name, Some(format!("loudnorm-v0.5.0-{target}.zip")), "{target}");
+        }
+    }
+
+    #[test]
+    fn asset_name_is_a_tar_gz_for_linux_targets() {
+        for target in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
+            let name = asset_name(&v(0, 5, 0), target);
+
+            assert_eq!(name, Some(format!("loudnorm-v0.5.0-{target}.tar.gz")), "{target}");
+        }
+    }
+
+    #[test]
+    fn asset_name_is_none_for_a_target_that_is_not_windows_msvc_macos_or_linux_gnu() {
+        let name = asset_name(&v(0, 5, 0), "wasm32-unknown-unknown");
+
+        assert_eq!(name, None);
+    }
+
+    const WINDOWS_ZIP: &str = "loudnorm-v0.5.0-x86_64-pc-windows-msvc.zip";
+
+    /// `release(0, 5, 0)` with the given `(name, url)` assets.
+    fn release_with_assets(assets: &[(&str, &str)]) -> Release {
+        Release {
+            assets: assets.iter().map(|&(name, url)| Asset { name: name.into(), url: url.into() }).collect(),
+            ..release(0, 5, 0)
+        }
+    }
+
+    #[test]
+    fn download_url_returns_the_url_of_the_asset_with_the_name() {
+        let release = release_with_assets(&[
+            (
+                "loudnorm-v0.5.0-aarch64-pc-windows-msvc.zip",
+                "https://github.com/htsign/loudnorm/releases/download/v0.5.0/loudnorm-v0.5.0-aarch64-pc-windows-msvc.zip",
+            ),
+            (WINDOWS_ZIP, "https://github.com/htsign/loudnorm/releases/download/v0.5.0/loudnorm-v0.5.0-x86_64-pc-windows-msvc.zip"),
+        ]);
+
+        let url = download_url(&release, WINDOWS_ZIP);
+
+        assert_eq!(url, Some("https://github.com/htsign/loudnorm/releases/download/v0.5.0/loudnorm-v0.5.0-x86_64-pc-windows-msvc.zip"));
+    }
+
+    #[test]
+    fn download_url_is_none_when_no_asset_has_exactly_the_name() {
+        let release = release_with_assets(&[(
+            WINDOWS_ZIP,
+            "https://github.com/htsign/loudnorm/releases/download/v0.5.0/loudnorm-v0.5.0-x86_64-pc-windows-msvc.zip",
+        )]);
+
+        for name in [
+            "loudnorm-v0.5.0-aarch64-pc-windows-msvc.zip",
+            "loudnorm-v0.5.0-x86_64-pc-windows-msvc",
+            "loudnorm-v0.5.0-x86_64-pc-windows-msvc.zip.bak",
+        ] {
+            let url = download_url(&release, name);
+
+            assert_eq!(url, None, "{name}");
+        }
+    }
+
+    #[test]
+    fn download_url_is_none_when_the_url_is_not_a_download_from_this_repository() {
+        for asset_url in [
+            "https://example.com/htsign/loudnorm/releases/download/v0.5.0/loudnorm-v0.5.0-x86_64-pc-windows-msvc.zip",
+            "https://github.com/evil/loudnorm/releases/download/v0.5.0/loudnorm-v0.5.0-x86_64-pc-windows-msvc.zip",
+            "https://github.com/htsign/loudnorm-evil/releases/download/v0.5.0/loudnorm-v0.5.0-x86_64-pc-windows-msvc.zip",
+            "http://github.com/htsign/loudnorm/releases/download/v0.5.0/loudnorm-v0.5.0-x86_64-pc-windows-msvc.zip",
+            "https://github.com/htsign/loudnorm/releases/download/../../../evil/loudnorm/releases/download/v0.5.0/loudnorm-v0.5.0-x86_64-pc-windows-msvc.zip",
+            "https://github.com/htsign/loudnorm/releases/download/%2e%2e/%2e%2e/%2e%2e/evil/loudnorm/releases/download/v0.5.0/loudnorm-v0.5.0-x86_64-pc-windows-msvc.zip",
+            "https://github.com/htsign/loudnorm/releases/download//v0.5.0/loudnorm-v0.5.0-x86_64-pc-windows-msvc.zip",
+            "https://github.com/htsign/loudnorm/releases/download/v0.5.0/loudnorm-v0.5.0-x86_64-pc-windows-msvc.zip?x=1",
+            "https://github.com/htsign/loudnorm/releases/tag/v0.5.0",
+        ] {
+            let release = release_with_assets(&[(WINDOWS_ZIP, asset_url)]);
+
+            let url = download_url(&release, WINDOWS_ZIP);
+
+            assert_eq!(url, None, "{asset_url}");
+        }
+    }
+
+    #[test]
+    fn download_url_is_none_when_the_url_points_at_another_tag_of_this_repository() {
+        let release = release_with_assets(&[(
+            WINDOWS_ZIP,
+            "https://github.com/htsign/loudnorm/releases/download/v0.1.0/loudnorm-v0.1.0-x86_64-pc-windows-msvc.zip",
+        )]);
+
+        let url = download_url(&release, WINDOWS_ZIP);
+
+        assert_eq!(url, None);
+    }
+
+    #[test]
+    fn download_url_is_none_when_the_last_part_of_the_url_is_not_the_asset_name() {
+        let release = release_with_assets(&[(WINDOWS_ZIP, "https://github.com/htsign/loudnorm/releases/download/v0.5.0/other.zip")]);
+
+        let url = download_url(&release, WINDOWS_ZIP);
+
+        assert_eq!(url, None);
+    }
+
+    const HASH_A_HEX: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const HASH_A: [u8; 32] = [
+        0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, //
+        0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
+    ];
+    const HASH_B_HEX: &str = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+
+    #[test]
+    fn sha256_from_sums_reads_the_hash_on_the_line_of_the_file() {
+        let sums = format!("{HASH_B_HEX}  loudnorm-v0.5.0-src.zip\n{HASH_A_HEX}  {WINDOWS_ZIP}\n");
+
+        let hash = sha256_from_sums(&sums, WINDOWS_ZIP);
+
+        assert_eq!(hash, Some(HASH_A));
+    }
+
+    #[test]
+    fn sha256_from_sums_reads_a_line_in_binary_mode() {
+        let sums = format!("{HASH_A_HEX} *{WINDOWS_ZIP}\n");
+
+        let hash = sha256_from_sums(&sums, WINDOWS_ZIP);
+
+        assert_eq!(hash, Some(HASH_A));
+    }
+
+    #[test]
+    fn sha256_from_sums_skips_a_line_with_a_single_space_before_the_name() {
+        let sums = format!("{HASH_B_HEX} {WINDOWS_ZIP}\n");
+
+        let hash = sha256_from_sums(&sums, WINDOWS_ZIP);
+
+        assert_eq!(hash, None);
+    }
+
+    #[test]
+    fn sha256_from_sums_skips_a_line_with_three_spaces_before_the_name() {
+        let sums = format!("{HASH_B_HEX}   {WINDOWS_ZIP}\n");
+
+        let hash = sha256_from_sums(&sums, WINDOWS_ZIP);
+
+        assert_eq!(hash, None);
+    }
+
+    #[test]
+    fn sha256_from_sums_does_not_read_a_text_mode_name_starting_with_an_asterisk_as_the_file() {
+        let sums = format!("{HASH_B_HEX}  *{WINDOWS_ZIP}\n");
+
+        let hash = sha256_from_sums(&sums, WINDOWS_ZIP);
+
+        assert_eq!(hash, None);
+    }
+
+    #[test]
+    fn sha256_from_sums_skips_a_line_with_non_ascii_text_around_the_hash_position() {
+        let sums = format!("{}あ  {WINDOWS_ZIP}\n{HASH_A_HEX}  {WINDOWS_ZIP}\n", &HASH_B_HEX[..62]);
+
+        let hash = sha256_from_sums(&sums, WINDOWS_ZIP);
+
+        assert_eq!(hash, Some(HASH_A));
+    }
+
+    #[test]
+    fn sha256_from_sums_reads_uppercase_hex() {
+        let sums = format!("0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF  {WINDOWS_ZIP}\n");
+
+        let hash = sha256_from_sums(&sums, WINDOWS_ZIP);
+
+        assert_eq!(hash, Some(HASH_A));
+    }
+
+    #[test]
+    fn sha256_from_sums_skips_lines_whose_name_only_starts_with_the_file() {
+        let sums = format!("{HASH_B_HEX}  {WINDOWS_ZIP}.bak\n{HASH_A_HEX}  {WINDOWS_ZIP}\n");
+
+        let hash = sha256_from_sums(&sums, WINDOWS_ZIP);
+
+        assert_eq!(hash, Some(HASH_A));
+    }
+
+    #[test]
+    fn sha256_from_sums_is_none_when_only_other_names_contain_the_file() {
+        let sums = format!("{HASH_B_HEX}  {WINDOWS_ZIP}.bak\n{HASH_B_HEX}  old-{WINDOWS_ZIP}\n");
+
+        let hash = sha256_from_sums(&sums, WINDOWS_ZIP);
+
+        assert_eq!(hash, None);
+    }
+
+    #[test]
+    fn sha256_from_sums_ignores_lines_without_64_hex_digits() {
+        for bad in [
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdeg",
+        ] {
+            let only_bad = format!("{bad}  {WINDOWS_ZIP}\n");
+            let bad_then_good = format!("{bad}  {WINDOWS_ZIP}\n{HASH_A_HEX}  {WINDOWS_ZIP}\n");
+
+            let from_only_bad = sha256_from_sums(&only_bad, WINDOWS_ZIP);
+            let from_bad_then_good = sha256_from_sums(&bad_then_good, WINDOWS_ZIP);
+
+            assert_eq!(from_only_bad, None, "{bad}");
+            assert_eq!(from_bad_then_good, Some(HASH_A), "{bad}");
+        }
+    }
+
+    #[test]
+    fn sha256_from_sums_is_none_when_the_file_is_not_listed() {
+        for sums in ["", &format!("{HASH_B_HEX}  loudnorm-v0.5.0-src.zip\n")] {
+            let hash = sha256_from_sums(sums, WINDOWS_ZIP);
+
+            assert_eq!(hash, None, "{sums:?}");
+        }
+    }
+
+    #[test]
+    fn sha256_from_sums_reads_lines_ending_with_crlf() {
+        let sums = format!("{HASH_A_HEX}  {WINDOWS_ZIP}\r\n{HASH_B_HEX}  loudnorm-v0.5.0-src.zip\r\n");
+
+        let hash = sha256_from_sums(&sums, WINDOWS_ZIP);
+
+        assert_eq!(hash, Some(HASH_A));
     }
 }
